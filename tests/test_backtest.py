@@ -19,14 +19,14 @@ tactmod = pytest.importorskip("aether.execution.tactics")
 riskmod = pytest.importorskip("aether.execution.risk")
 autopsymod = pytest.importorskip("aether.worldmodel.autopsy")
 
-from aether.execution.backtest import Backtester, save_result
+from aether.execution.backtest import Backtester, PassThroughRisk, save_result
 from aether.execution.interfaces import BacktestConfig, ReversalSignal, RiskConfig
 from aether.execution.risk import RiskManager
 from aether.worldmodel.autopsy import Autopsist
 from aether.worldmodel.interfaces import TradeRecord
 
 from tests.conftest import synth_sessions
-from tests.helpers_stack import load_npz, make_embedding_npz_dir
+from tests.helpers_stack import SESSION_BARS, load_npz, make_embedding_npz_dir
 
 FEES_BPS = 1.0
 SLIP_BPS = 2.0
@@ -62,11 +62,76 @@ class OneShotEngine:
             evidence=None)
 
 
+class AlwaysLongEngine:
+    """Fires a long AAPL signal at EVERY bar it is consulted on."""
+
+    def __init__(self, arrays: dict, stop_frac: float, target_frac: float,
+                 horizon: int = 10_000):
+        self.arrays = arrays
+        self.stop_frac = float(stop_frac)
+        self.target_frac = float(target_frac)
+        self.horizon = int(horizon)
+
+    def generate(self, ticker, idx, emb=None, *args, **kwargs):
+        if ticker != "AAPL":
+            return None
+        idx = int(idx)
+        px = float(self.arrays["close_px"][idx])
+        return ReversalSignal(
+            signal_id=f"AL-{idx}", ts=int(self.arrays["anchor_ts"][idx]),
+            ticker="AAPL", side="long", conviction=0.9,
+            entry_px=px, stop_px=px * self.stop_frac,
+            target_px=px * self.target_frac,
+            horizon_bars=self.horizon, size_frac=0.1,
+            rationale="always-long stub", evidence=None)
+
+
 def _tactics(cfg):
     try:
         return tactmod.ExecutionTactics()
     except TypeError:
         return tactmod.ExecutionTactics(cfg)
+
+
+def _downtrend(arrays):
+    """Rewrite AAPL into a clean −0.3%/bar downtrend per session (next_*
+    stays session-bounded: last row NaN, per the EmbeddingStore contract)."""
+    n = SESSION_BARS
+    n_sessions = arrays["close_px"].shape[0] // n
+    for s in range(n_sessions):
+        lo, hi = s * n, (s + 1) * n
+        base = 100.0 * (1.0 + 0.01 * s)
+        m = np.arange(n, dtype=np.float64)
+        c = base * (1.0 - 0.003) ** m
+        o = np.empty_like(c)
+        o[0] = base
+        o[1:] = c[:-1]
+        h = np.maximum(o, c) * 1.001
+        l = np.minimum(o, c) * 0.999
+        arrays["close_px"][lo:hi] = c
+        arrays["next_open"][lo:hi] = np.append(o[1:], np.nan)
+        arrays["next_high"][lo:hi] = np.append(h[1:], np.nan)
+        arrays["next_low"][lo:hi] = np.append(l[1:], np.nan)
+        arrays["next_close"][lo:hi] = np.append(c[1:], np.nan)
+
+
+def _always_long_run(tmp_path, stop_frac: float, target_frac: float,
+                     mutator=None):
+    from tests.helpers_stack import rewrite_npz
+
+    emb_dir = make_embedding_npz_dir(tmp_path, seed=0)
+    if mutator is not None:
+        rewrite_npz(emb_dir, "AAPL", mutator)
+    arrays = load_npz(emb_dir, "AAPL")
+    days = synth_sessions(2)
+    cfg = BacktestConfig(
+        tickers=("AAPL",), start=str(days[0]), end=str(days[-1]),
+        fees_bps=FEES_BPS, slippage_bps=SLIP_BPS,
+        initial_equity=INITIAL_EQ, autopsy_losses=False)
+    engine = AlwaysLongEngine(arrays, stop_frac, target_frac)
+    bt = Backtester(cfg, str(emb_dir), engine, PassThroughRisk(), None,
+                    _tactics(cfg), data_root=tmp_path)
+    return cfg, arrays, bt.run_signals()
 
 
 @pytest.fixture(scope="module")
@@ -148,6 +213,60 @@ class TestRunSignals:
         assert any(t.pnl < 0 for t in result.trades)
         assert len(result.autopsies) >= 1, \
             "autopsy_losses=True must autopsy the losing trade"
+
+
+class TestSessionBoundary:
+    def test_no_position_survives_a_session_boundary(self, tmp_path):
+        """MAJOR-2 regression: with contract-conform stores (session-last
+        rows carry NaN ``next_*``) the eod force-close must fire at the
+        session's LAST REAL bar; positions must never cross the overnight
+        boundary."""
+        # stop far below / target far above: nothing exits intraday, so
+        # every position rides to the session end.
+        _, arrays, result = _always_long_run(tmp_path, stop_frac=0.50,
+                                             target_frac=2.00)
+        trades = [t for t in result.trades if t.ticker == "AAPL"]
+        assert trades, "the always-long engine must produce trades"
+        eod = [t for t in trades if t.exit_reason == "eod"]
+        assert len(eod) == 2, \
+            f"expected one eod close per session, got {len(eod)}"
+        slip = SLIP_BPS / 1e4
+        for k, rec in enumerate(sorted(eod, key=lambda t: t.exit_ts)):
+            # eod fill = final REAL bar's close (the bar after the
+            # second-to-last anchor), slipped against the agent.
+            i = (k + 1) * SESSION_BARS - 2
+            assert rec.exit_ts == int(arrays["anchor_ts"][i]) + 60
+            assert rec.exit_px == pytest.approx(
+                float(arrays["next_close"][i]) * (1.0 - slip), rel=1e-9)
+        for t in trades:
+            entry_day = pd.Timestamp(int(t.entry_ts), unit="s").date()
+            exit_day = pd.Timestamp(int(t.exit_ts), unit="s").date()
+            assert entry_day == exit_day, \
+                f"trade {t.trade_id} survived a session boundary"
+
+
+class TestNoSameBarReentry:
+    def test_no_entry_prints_at_another_trades_exit(self, tmp_path):
+        """MAJOR-3 regression: a ticker whose position exits on fill bar
+        t+1 may not accept a new entry decided at t — the entry would
+        print (at t+1's open) BEFORE the exit it depends on. Earliest
+        re-entry decides at t+1 and fills at t+2."""
+        # clean downtrend + tight stop: repeated stop-outs with immediate
+        # re-entry pressure from the always-long stub.
+        _, _, result = _always_long_run(tmp_path, stop_frac=0.99,
+                                        target_frac=10.0,
+                                        mutator=_downtrend)
+        trades = result.trades
+        stops = [t for t in trades if t.exit_reason == "stop"]
+        assert len(stops) >= 2, \
+            "fixture must produce repeated stop-outs to exercise re-entry"
+        for a in trades:
+            for b in trades:
+                if a is b or a.ticker != b.ticker:
+                    continue
+                assert int(a.entry_ts) != int(b.exit_ts), (
+                    f"entry {a.trade_id} prints on the same bar as exit "
+                    f"{b.trade_id} — same-bar exit→re-entry leaked through")
 
 
 class TestSaveResult:

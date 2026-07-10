@@ -24,6 +24,9 @@ the ``EmbeddingStore.load`` format::
     next_low       [N]     float64   next bar's low
     next_close     [N]     float64   next bar's close
 
+``next_*`` never crosses a session boundary: each session's LAST row holds
+NaN, per the EmbeddingStore contract (no same-session fill bar exists).
+
 The price path is a deterministic sine + drift so every fill is predictable:
 
 * bars ``0 .. flat_from-1`` of each session: ``close = base * (1 + 0.05 *
@@ -134,7 +137,17 @@ def make_embedding_npz_dir(tmp_path,
                                     for m in range(n_bars)]
 
         def _next(a: np.ndarray) -> np.ndarray:
-            return np.append(a[1:], close[-1])
+            """Shift by one bar; session-LAST rows get NaN ``next_*``.
+
+            The EmbeddingStore contract says the last anchor of each session
+            has NaN next_* — there is no same-session fill bar. A plain
+            shift would bleed session 2's first bar into session 1's last
+            anchor, silently letting positions trade across the overnight
+            boundary (this exact bleed masked a real eod bug).
+            """
+            out = np.append(a[1:].astype(np.float64), np.nan)
+            out[n_bars - 1::n_bars] = np.nan
+            return out
 
         np.savez(
             out / f"{ticker}.npz",

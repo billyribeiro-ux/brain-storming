@@ -271,6 +271,9 @@ class TestFillMath:
 
 class TestStopBeforeTarget:
     def test_wide_bar_touching_both_levels_fills_stop(self, emb_dir):
+        cfg = _cfg(emb_dir)
+        slip = cfg.slippage_bps / 1e4
+
         def widen(arrays):
             sl = slice(ENTER_MINUTE, ENTER_MINUTE + 7)
             arrays["next_high"][sl] = arrays["close_px"][sl] * 1.10
@@ -288,9 +291,67 @@ class TestStopBeforeTarget:
         rec = d.records[0]
         assert rec.exit_reason == "stop", \
             "when stop and target are both touched in one bar, stop must win"
-        assert rec.exit_px <= rec.stop_px * (1.0 + 1e-9), \
-            "long stop fill can never improve on the stop price"
+        # A stop is a market order: the raw fill is the WORSE of the stop
+        # price and the fill bar's open (gap-through semantics), slipped.
+        exit_bar_open = float(arrays["next_open"][rec.signal_meta["exit_bar"] - 1])
+        assert rec.exit_px == pytest.approx(
+            min(rec.stop_px, exit_bar_open) * (1.0 - slip), rel=1e-9), \
+            "long stop must fill at min(stop, open) * (1 - slippage), exactly"
         assert rec.pnl < 0
+
+    def test_gap_through_stop_fills_at_worse_open(self, emb_dir):
+        """A bar that OPENS below a long's stop fills at the open (worse),
+        not at the stop price — a market stop triggered by a gap executes
+        at/beyond the first print."""
+        cfg = _cfg(emb_dir)
+        slip = cfg.slippage_bps / 1e4
+        gap_i = ENTER_MINUTE + 1        # fill bar for the decision at t+1
+
+        def gap_down(arrays):
+            px = arrays["close_px"][gap_i]
+            arrays["next_open"][gap_i] = px * 0.95
+            arrays["next_high"][gap_i] = px * 0.955
+            arrays["next_low"][gap_i] = px * 0.94
+            arrays["next_close"][gap_i] = px * 0.945
+
+        arrays = rewrite_npz(emb_dir, "AAPL", gap_down)
+        d = _driver(emb_dir, arrays)
+        d.run_to_minute(ENTER_MINUTE)
+        d.step(trade=ENTER, size=1.0, stop=1.0, target=1.0)
+        assert not d.records, "entry bar is quiet — position must survive it"
+        d.step(trade=HOLD)              # sweeps the gapped bar
+        assert d.records, "gapped bar must stop the position out"
+        rec = d.records[0]
+        assert rec.exit_reason == "stop"
+        gap_open = float(arrays["next_open"][gap_i])
+        assert gap_open < rec.stop_px, "fixture must actually gap through"
+        assert rec.exit_px == pytest.approx(gap_open * (1.0 - slip), rel=1e-9), \
+            "gap-through stop must fill at the bar's open (the worse price)"
+        assert rec.exit_px < rec.stop_px, \
+            "gap fill must be strictly worse than the stop price"
+
+    def test_entry_bar_stop_between_open_and_fill_fills_at_open(self, emb_dir,
+                                                                aapl):
+        """Corollary: an (extreme) stop lying between the slipped entry fill
+        and the bar's open triggers immediately and fills at ~the open —
+        never at the stop price above it."""
+        cfg = _cfg(emb_dir)
+        slip = cfg.slippage_bps / 1e4
+        d = _driver(emb_dir, aapl)
+        d.run_to_minute(ENTER_MINUTE)
+        b = d.bar()
+        # stop=1e-6 puts the stop a hair below the slipped fill, which is
+        # ABOVE the bar's open: the open (the first print after our fill)
+        # already trades below the stop.
+        d.step(trade=ENTER, size=1.0, stop=1e-6, target=1.0)
+        assert d.records, "the entry-bar sweep must stop this position out"
+        rec = d.records[0]
+        assert rec.exit_reason == "stop"
+        bar_open = float(aapl["next_open"][b])
+        assert bar_open < rec.stop_px <= rec.entry_px * (1.0 + 1e-12), \
+            "fixture must place the stop between the open and the fill"
+        assert rec.exit_px == pytest.approx(bar_open * (1.0 - slip), rel=1e-9), \
+            "entry-bar stop above the open must fill at open * (1 - slip)"
 
 
 # --------------------------------------------------------------------------- #
@@ -430,6 +491,27 @@ class TestStandAside:
 # --------------------------------------------------------------------------- #
 # (h) adjust may tighten the stop, never widen it
 # --------------------------------------------------------------------------- #
+
+class TestAutoResetPool:
+    def test_replacement_episode_comes_from_reset_pool(self, emb_dir, aapl):
+        """Same-step auto-reset must resample from the pool passed to
+        reset() (the curriculum stage), not from ALL episodes — every
+        rollout crosses an episode boundary, so leaking here silently
+        defeats curriculum staging."""
+        env = TradingEnv(_cfg(emb_dir), n_envs=1)
+        assert len(env.episodes) >= 4, "fixture must offer non-pool episodes"
+        idx = _episode_index(env)                     # (AAPL, session 1)
+        d = Driver(env, aapl)
+        d.reset([idx])                                # 1-episode pool
+        for _ in range(3):                            # 3 auto-reset draws
+            d.run_to_done()
+            # The auto-reset obs is bar 0 of the replacement episode; with
+            # a 1-episode pool it must be the SAME episode's first bar.
+            # (Driver.bar() itself fails loudly if the obs matched no AAPL
+            # row at all — i.e. if an SPY episode leaked in.)
+            assert d.bar() == 0, \
+                "auto-reset replacement escaped the 1-episode reset pool"
+
 
 class TestAdjustStop:
     def test_stop_tightens_but_never_widens(self, emb_dir, aapl):

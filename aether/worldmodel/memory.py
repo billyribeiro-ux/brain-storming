@@ -9,7 +9,10 @@ the world model that answers two different questions:
   a perception embedding (the key) tagged with its instrument, timestamp
   and realized outcome. Retrieval is cosine nearest-neighbor: two moments
   whose fused embeddings point the same way in representation space were,
-  by the perception model's judgment, the same kind of moment.
+  by the perception model's judgment, the same kind of moment. Live/replay
+  consumers pass ``as_of`` (the query bar's anchor time) so retrieval is
+  embargo-filtered: an analog whose outcome window overlaps — or follows —
+  the query moment would leak the future (see :meth:`MemoryBank.query`).
 
 * **Semantic tier** (``consolidate``) — *"what KINDS of moments exist, and
   what happens after each kind on average?"* Periodic k-means over the
@@ -197,7 +200,9 @@ class MemoryBank(MemoryBankProtocol):
         self._ptr = (self._ptr + n) % capacity
         self._size = min(self._size + n, capacity)
 
-    def query(self, key: Tensor | np.ndarray, k: int = 8) -> list[MemoryAnalog]:
+    def query(self, key: Tensor | np.ndarray, k: int = 8,
+              as_of: int | None = None,
+              embargo_s: int = 1800) -> list[MemoryAnalog]:
         """Retrieve the ``k`` most cosine-similar episodes to ``key``.
 
         Parameters
@@ -207,12 +212,26 @@ class MemoryBank(MemoryBankProtocol):
             current fused perception embedding.
         k:
             Maximum analogs to return; silently truncated to the bank size.
+        as_of:
+            Optional query-moment anchor timestamp (epoch-seconds). When
+            given, only episodes with ``anchor_ts <= as_of - embargo_s``
+            are eligible. This is the no-look-ahead invariant applied to
+            retrieval: a stored outcome such as ``fwd_ret_30m`` covers the
+            30 minutes AFTER its own anchor, so an analog anchored inside
+            the embargo window (or later) would leak the query moment's
+            own future into the evidence. ``None`` (the default) keeps the
+            unfiltered behavior for offline consumers that query with
+            hindsight on purpose (autopsies, consolidation audits).
+        embargo_s:
+            Width of the exclusion window in seconds; defaults to 1800
+            (30 minutes — the longest outcome horizon stored per episode).
 
         Returns
         -------
         list[MemoryAnalog]
-            Sorted by similarity, descending. Empty bank ⇒ ``[]`` (a young
-            system simply has no analogs yet — not an error).
+            Sorted by similarity, descending. Empty bank — or no episode
+            surviving the embargo — ⇒ ``[]`` (a young system simply has no
+            analogs yet — not an error).
         """
         if self._size == 0:
             return []
@@ -227,18 +246,31 @@ class MemoryBank(MemoryBankProtocol):
                 f"got {q_arr.shape[0]}"
             )
 
+        if as_of is None:
+            live: np.ndarray | None = None                # all rows, zero-copy
+            bank_np = self._keys[: self._size]
+        else:
+            cutoff = int(as_of) - int(embargo_s)
+            live = np.array(
+                [i for i in range(self._size)
+                 if int(self._metas[i]["anchor_ts"]) <= cutoff],
+                dtype=np.int64)
+            if live.size == 0:
+                return []
+            bank_np = self._keys[live]
+
         # Normalized matmul == cosine. Retrieval math runs in torch (CPU)
         # so topk and normalization reuse one well-tested code path.
-        bank = torch.from_numpy(self._keys[: self._size])          # [S, dim]
+        bank = torch.from_numpy(bank_np)                           # [S, dim]
         q = torch.from_numpy(q_arr.astype(np.float32, copy=False)) # [dim]
         bank_n = bank / bank.norm(dim=1, keepdim=True).clamp_min(_NORM_EPS)
         q_n = q / q.norm().clamp_min(_NORM_EPS)
         sims = bank_n @ q_n                                        # [S]
 
-        top = torch.topk(sims, k=min(k, self._size))
+        top = torch.topk(sims, k=min(k, int(bank_np.shape[0])))
         analogs: list[MemoryAnalog] = []
-        for sim, idx in zip(top.values.tolist(), top.indices.tolist()):
-            meta = self._metas[idx]
+        for sim, pos in zip(top.values.tolist(), top.indices.tolist()):
+            meta = self._metas[pos if live is None else int(live[pos])]
             extras = {
                 key_: val for key_, val in meta.items()
                 if key_ not in _REQUIRED_META_KEYS

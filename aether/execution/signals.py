@@ -280,7 +280,12 @@ class SignalEngine:
         imagination = self._imagination_agreement(fused_all, close_all, idx, w0, side)
 
         # --- 4. Analog evidence (memory outcomes). --------------------------
-        analog_winrate, analogs_summary = self._analog_evidence(fused_all[idx], side)
+        # The query bar's anchor_ts is passed as `as_of` so the memory bank
+        # embargo-filters analogs: an analog anchored within 30 minutes of
+        # (or after) this moment carries an outcome that overlaps our own
+        # future — using it would leak fwd_ret_30m into conviction.
+        analog_winrate, analogs_summary = self._analog_evidence(
+            fused_all[idx], side, as_of=int(emb["anchor_ts"][idx]))
 
         # --- 5. Consensus: renormalized weighted geometric mean. ------------
         available: dict[str, float] = {}
@@ -509,17 +514,37 @@ class SignalEngine:
         return float(np.mean(favorable))
 
     def _analog_evidence(self, key: np.ndarray, side: str,
+                         as_of: Optional[int] = None,
                          ) -> tuple[Optional[float], list[dict]]:
         """30-minute outcome agreement among memory analogs.
 
         A win is a strictly favorable ``fwd_ret_30m`` for the side (zero
         counts against — conservative). Analogs without the outcome key are
         excluded from the rate but still listed in the summary.
+
+        ``as_of`` (the query bar's anchor_ts) is forwarded to
+        ``MemoryBank.query`` so retrieval is embargo-filtered — analogs
+        anchored within the outcome horizon of the query moment (or after
+        it) would leak their own future, which IS our future, into the
+        winrate. A duck-typed memory that predates the ``as_of`` parameter
+        is queried unfiltered with a loud one-time warning: silently
+        pretending the filter applied would be worse than admitting it
+        did not.
         """
         if self.memory is None:
             return None, []
-        analogs = self.memory.query(np.asarray(key, dtype=np.float32),
-                                    k=self.cfg.memory_k)
+        try:
+            analogs = self.memory.query(np.asarray(key, dtype=np.float32),
+                                        k=self.cfg.memory_k, as_of=as_of)
+        except TypeError:
+            if not getattr(self, "_warned_no_as_of", False):
+                self._warned_no_as_of = True
+                logger.warning(
+                    "memory.query does not accept as_of — analog retrieval "
+                    "is NOT embargo-filtered; near-future analogs may leak "
+                    "outcome information into conviction")
+            analogs = self.memory.query(np.asarray(key, dtype=np.float32),
+                                        k=self.cfg.memory_k)
         summary = [{
             "ticker": a.ticker,
             "anchor_ts": int(a.anchor_ts),

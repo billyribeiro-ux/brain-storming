@@ -131,8 +131,12 @@ def _take(arrs: dict[str, np.ndarray], idx: np.ndarray) -> dict[str, np.ndarray]
 def manage_position(pos: dict, next_open: float, next_high: float,
                     next_low: float, next_close: float, session_last: bool,
                     fees_frac: float, slip_frac: float, exit_ts: int,
-                    entry_bar: bool = False) -> TradeRecord | None:
+                    entry_bar: bool = False,
+                    allow_target: bool = True) -> TradeRecord | None:
     """Evaluate one position against one execution bar; close it if due.
+
+    ``session_last`` means the EXECUTION bar being evaluated is its
+    session's final tradable bar (Aether never holds overnight).
 
     Event order inside the bar (deliberately conservative):
 
@@ -143,17 +147,33 @@ def manage_position(pos: dict, next_open: float, next_high: float,
        against the agent,
     3. target — a *limit* order: fills at exactly the target price iff the
        bar range trades through it; stop is checked FIRST, so a bar touching
-       both resolves as a stop (stop-before-target),
+       both resolves as a stop (stop-before-target). On a MAKER (limit)
+       entry's own fill bar the caller passes ``allow_target=False``: the
+       bar's favorable extreme may have printed BEFORE the limit entry even
+       filled, so crediting a same-bar target would be optimistic. The
+       same-bar STOP stays enabled — a deliberately conservative asymmetry,
     4. end of session — force close at the bar's close ("eod").
 
-    Bars with any non-finite OHLC are skipped entirely (no exit checks, no
-    bar counted — NaN never propagates into fills). ``pos`` is mutated
+    Bars with any non-finite OHLC are skipped for exit checks (no bar
+    counted — NaN never propagates into fills), EXCEPT that a session-last
+    force close must still fire: a position must never survive a session
+    boundary just because the final bar's data is holed. In that case the
+    close uses the first finite price the bar offers (close preferred);
+    only a bar with no finite price at all returns ``None`` and leaves the
+    caller's stranded-position sweep as the last resort. ``pos`` is mutated
     (``bars_held``); a :class:`TradeRecord` is returned when the position
     closes, else ``None``. Cash effects are the caller's job.
     """
     o, h, l, c = (float(next_open), float(next_high),
                   float(next_low), float(next_close))
     if not all(math.isfinite(v) for v in (o, h, l, c)):
+        # eod BEFORE the NaN early-return: the no-overnight rule outranks
+        # the no-NaN-fills rule; close at the best finite price available.
+        if session_last:
+            for px in (c, o, h, l):
+                if math.isfinite(px):
+                    return close_position(pos, px, "eod", exit_ts, fees_frac,
+                                          slip_frac, detail="nan_bar")
         return None
     d = 1.0 if pos["side"] == "long" else -1.0
 
@@ -167,7 +187,7 @@ def manage_position(pos: dict, next_open: float, next_high: float,
     if (d > 0 and l <= stop) or (d < 0 and h >= stop):
         raw = min(stop, o) if d > 0 else max(stop, o)  # gap through = worse fill
         return close_position(pos, raw, "stop", exit_ts, fees_frac, slip_frac)
-    if (d > 0 and h >= target) or (d < 0 and l <= target):
+    if allow_target and ((d > 0 and h >= target) or (d < 0 and l <= target)):
         return close_position(pos, target, "target", exit_ts, fees_frac,
                               slip_frac, is_limit=True)
     if session_last:
@@ -447,8 +467,15 @@ class Backtester:
            bar ``t+1``, then apply the same conservative exit checks to the
            entry bar itself (a stop can fire on the bar you entered).
 
-        One position per ticker, max. Signals on a session's last anchor are
-        skipped (the entry bar would be force-closed instantly at eod).
+        One position per ticker, max. Signals whose fill bar would be the
+        session's last bar are skipped (the entry would be force-closed
+        instantly at eod). A ticker whose position EXITED during step 2 (on
+        fill bar ``t+1``) may not accept a new entry decided at ``t``: that
+        entry would print at bar ``t+1``'s open, chronologically BEFORE the
+        stop/target exit it depends on for the book to be flat — the
+        decision at ``t`` was made while still positioned. Earliest
+        re-entry is a signal decided at ``t+1`` (filling ``t+2``), exactly
+        the ordering ``TradingEnv._step_env`` enforces.
         """
         if self.signal_engine is None:
             raise ValueError("run_signals() needs a signal_engine")
@@ -517,6 +544,7 @@ class Backtester:
                 break
 
             # ---- 2) manage open positions on bar t+1 --------------------- #
+            exited_this_bar: set[str] = set()
             for ticker, i in active.items():
                 pos = positions.get(ticker)
                 if pos is None:
@@ -532,14 +560,24 @@ class Backtester:
                     realized += rec.pnl
                     trades.append(rec)
                     del positions[ticker]
+                    exited_this_bar.add(ticker)
 
             # ---- 3) new signals at bar t --------------------------------- #
             for ticker, i in active.items():
                 if ticker in positions:
                     continue  # one position per ticker, max
+                if ticker in exited_this_bar:
+                    # The exit above happened ON fill bar t+1; an entry
+                    # decided at t would print at t+1's open, BEFORE that
+                    # exit — and the decision was made while the book was
+                    # still positioned. No same-bar exit→re-entry; the
+                    # earliest re-entry decides at t+1 and fills at t+2
+                    # (mirrors TradingEnv._step_env's entry-before-sweep
+                    # ordering).
+                    continue
                 arrs = data[ticker]
                 if self._session_last(arrs, i):
-                    continue  # entry bar would instantly eod-close
+                    continue  # fill bar would instantly eod-close
                 nxt = (float(arrs["next_open"][i]), float(arrs["next_high"][i]),
                        float(arrs["next_low"][i]), float(arrs["next_close"][i]))
                 if not all(math.isfinite(v) for v in nxt):
@@ -561,10 +599,15 @@ class Backtester:
                     continue
                 cash -= pos["q"] * pos["entry_px"] + pos["entry_fee"]
                 positions[ticker] = pos
-                # conservative same-bar exit check on the entry bar
+                # Conservative same-bar exit check on the entry bar. After a
+                # MAKER (limit) entry fill the same-bar TARGET is not
+                # credited: the bar's favorable extreme may predate the
+                # fill itself; the same-bar stop stays active (documented
+                # conservative asymmetry — see manage_position).
                 rec = manage_position(
                     pos, *nxt, self._session_last(arrs, i), fees, slip,
-                    exit_ts=int(arrs["anchor_ts"][i]) + 60, entry_bar=True)
+                    exit_ts=int(arrs["anchor_ts"][i]) + 60, entry_bar=True,
+                    allow_target=pos["meta"].get("order_type") != "limit")
                 if rec is not None:
                     cash += pos["q"] * rec.exit_px - (rec.fees - pos["entry_fee"])
                     realized += rec.pnl
@@ -663,16 +706,33 @@ class Backtester:
                                "before all episodes finished", ids, max_episode_steps)
             episode_paths.extend(paths)
 
-        equity_curve = self._aggregate_policy_equity(episode_paths, trades)
+        equity_curve, equity_source = self._aggregate_policy_equity(
+            episode_paths, trades)
         autopsies = self._run_autopsies(trades)
         stats = compute_stats(equity_curve, trades)
-        logger.info("run_policy: %d episodes, %d trades", n_episodes, len(trades))
+        stats["equity_source"] = equity_source
+        if equity_source != "env_step_equity":
+            # The fallback curve holds one point per TRADE EXIT (or a flat
+            # placeholder), not per bar: Sharpe/Sortino annualized with the
+            # per-minute sqrt(390*252) factor would be silently meaningless
+            # on it. Marked None rather than invented.
+            stats["sharpe"] = None
+            stats["sortino"] = None
+        logger.info("run_policy: %d episodes, %d trades (equity_source=%s)",
+                    n_episodes, len(trades), equity_source)
         return BacktestResult(equity_curve=equity_curve, trades=trades,
                               stats=stats, signals=[], autopsies=autopsies)
 
     def _aggregate_policy_equity(self, episode_paths: list[list[float]],
-                                 trades: list[TradeRecord]) -> pd.DataFrame:
-        """Chain per-episode equity paths into one curve (see run_policy doc)."""
+                                 trades: list[TradeRecord]
+                                 ) -> tuple[pd.DataFrame, str]:
+        """Chain per-episode equity paths into one curve (see run_policy doc).
+
+        Returns ``(curve, source)`` where ``source`` labels how the curve
+        was built — ``'env_step_equity'`` (per-bar, stats-grade),
+        ``'trade_pnl_fallback'`` (one point per trade exit; per-bar stats
+        are NOT valid on it) or ``'flat'`` (no data at all).
+        """
         initial = float(self.cfg.initial_equity)
         rows: list[tuple[int, float]] = []
         if any(episode_paths):
@@ -685,17 +745,23 @@ class Backtester:
                     rows.append((idx, running * (v / initial)))
                     idx += 1
                 running *= path[-1] / initial
+            source = "env_step_equity"
         elif trades:
             logger.warning("run_policy: env infos carried no 'equity' — "
-                           "curve reconstructed from cumulative trade PnL")
+                           "curve reconstructed from cumulative trade PnL "
+                           "(stats['equity_source']='trade_pnl_fallback'; "
+                           "sharpe/sortino are not computable per-bar and "
+                           "are reported as None)")
             eq = initial
             rows.append((int(min(t.entry_ts for t in trades)), eq))
             for t in sorted(trades, key=lambda t: t.exit_ts):
                 eq += float(t.pnl)
                 rows.append((int(t.exit_ts), eq))
+            source = "trade_pnl_fallback"
         else:
             rows.append((0, initial))
-        return pd.DataFrame(rows, columns=["ts", "equity"])
+            source = "flat"
+        return pd.DataFrame(rows, columns=["ts", "equity"]), source
 
     # ------------------------------------------------------------------ #
     # Internals
@@ -741,15 +807,37 @@ class Backtester:
 
     @staticmethod
     def _session_last(arrs: dict[str, np.ndarray], i: int) -> bool:
-        """True when anchor ``i`` is its session's last (next anchor rolls
-        to a new session/day, or the data ends)."""
+        """True when anchor ``i``'s EXECUTION bar (bar ``i+1``, the
+        ``next_*`` arrays at ``i``) is its session's final tradable bar.
+
+        On a contract store the session's LAST anchor has NaN ``next_*``
+        (no same-session fill bar exists), so the anchor whose execution
+        bar is the final bar is the SECOND-to-last one — the anchor whose
+        FOLLOWING anchor is the session's final anchor. Flagging the last
+        anchor itself (the previous behavior) made the eod force-close
+        unreachable: ``manage_position`` skipped the NaN bar and positions
+        silently survived the session boundary. Both the last anchor and
+        the one before it return True here — the last anchor's NaN
+        execution bar is untradable either way, and entries are gated on
+        this flag so no fill can land on a bar that would be force-closed
+        the instant it prints.
+        """
         ats = arrs["anchor_ts"]
-        if i + 1 >= ats.shape[0]:
-            return True
-        same_day = (int(ats[i + 1]) // _SECONDS_PER_DAY
-                    == int(ats[i]) // _SECONDS_PER_DAY)
-        minute_up = int(arrs["session_minute"][i + 1]) > int(arrs["session_minute"][i])
-        return not (same_day and minute_up)
+        sm = arrs["session_minute"]
+        n = int(ats.shape[0])
+
+        def _rolls(j: int) -> bool:
+            """True when anchor ``j`` has no same-session successor."""
+            if j + 1 >= n:
+                return True
+            same_day = (int(ats[j + 1]) // _SECONDS_PER_DAY
+                        == int(ats[j]) // _SECONDS_PER_DAY)
+            minute_up = int(sm[j + 1]) > int(sm[j])
+            return not (same_day and minute_up)
+
+        # anchor i is itself session-final (NaN execution bar), OR its
+        # execution bar — anchor i+1's bar — is the session's final one.
+        return _rolls(i) or _rolls(i + 1)
 
     def _enter(self, ticker: str, i: int, arrs: dict[str, np.ndarray],
                sig: ReversalSignal, decision: RiskDecision,

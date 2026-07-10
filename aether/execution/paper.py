@@ -8,10 +8,14 @@ One :meth:`PaperTrader.run_once` iteration:
    newer bar than the newest embedding, WARN that embeddings need
    re-precompute — stale state is never traded silently (new entries are
    skipped for stale tickers; existing positions are still marked/managed),
-3. manage open positions against the newest execution bar (same
-   conservative stop-before-target / horizon / eod logic as the backtester,
-   shared via :func:`aether.execution.backtest.manage_position`),
-4. mark open positions against the newest close,
+3. manage open positions against EVERY completed execution bar since the
+   previous run (same conservative stop-before-target / horizon / eod
+   logic as the backtester, shared via
+   :func:`aether.execution.backtest.manage_position`); the newest anchor's
+   execution bar is not yet known (its ``next_*`` is NaN — the future),
+   so management honestly runs one bar behind the data,
+4. mark open positions against the newest completed close (``close_px`` of
+   the newest anchor — same one-bar lag, same honesty),
 5. generate signals on the newest bar per flat ticker, risk-check them, and
    simulate fills via tactics (maker limits are single-bar fill-or-cancel,
    exactly as in backtests),
@@ -51,9 +55,13 @@ logger = get_logger("aether.paper")
 
 DEFAULT_EQUITY: float = 100_000.0
 
-#: Substrings in risk reasons that indicate a circuit breaker, not a mere
-#: size rejection — these produce a "halt" blotter event.
-_HALT_MARKERS: tuple[str, ...] = ("halt", "daily", "circuit", "loss stop")
+#: Prefix of the circuit breaker's REJECTION line in RiskDecision.reasons
+#: (aether.execution.risk emits "[circuit-breaker] HALTED: ..."). Used only
+#: as a fallback for duck-typed risk managers that expose no ``state`` —
+#: substring "vibes" matching is banned here: the old marker list matched
+#: the breaker's PASS line ("above the −2.00% halt threshold") and turned
+#: every ordinary size rejection into a phantom halt event.
+_HALT_REJECT_PREFIX: str = "[circuit-breaker] halted"
 
 
 class PaperTrader:
@@ -181,26 +189,47 @@ class PaperTrader:
         day_start = float(state.get("day_start_equity") or equity)
         day_pnl_frac = (equity / day_start - 1.0) if day_start else 0.0
 
-        # ---- manage open positions on the newest execution bar ------------- #
+        # ---- manage open positions over EVERY bar since the last run ------- #
+        # All execution bars with anchor_ts > the position's last_managed_ts
+        # are replayed IN ORDER with the same conservative bracket semantics
+        # as the backtester. Managing only the newest bar (the previous
+        # behavior) let positions walk straight past their stops during any
+        # downtime — a stop touched 28 bars ago simply never fired.
+        #
+        # Only COMPLETED bars are evaluable: the newest anchor's next_* is
+        # NaN on a live store (precompute cannot know a bar that has not
+        # happened), so management honestly runs ONE BAR BEHIND the data —
+        # the documented one-bar operational lag. last_managed_ts advances
+        # only through bars actually evaluated, so the pending bar is
+        # re-checked on the next run once the store learns it.
         for ticker in list(positions):
             arrs = loaded.get(ticker)
             if arrs is None:
                 continue
-            i = int(arrs["anchor_ts"].shape[0]) - 1
-            bar_ts = int(arrs["anchor_ts"][i])
             pos = positions[ticker]
-            if bar_ts <= int(pos.get("last_managed_ts", -1)):
-                continue  # this bar was already processed on a prior run
-            pos["last_managed_ts"] = bar_ts
-            rec = manage_position(
-                pos, arrs["next_open"][i], arrs["next_high"][i],
-                arrs["next_low"][i], arrs["next_close"][i],
-                self._session_last_bar(arrs, i), self.fees_frac,
-                self.slip_frac, exit_ts=bar_ts + 60)
-            if rec is not None:
-                self._apply_close(state, ticker, rec)
-                self._emit("order", {"action": "exit", "trade": asdict(rec)})
-                n_events += 1
+            ats = arrs["anchor_ts"].astype(np.int64)
+            start = int(np.searchsorted(
+                ats, int(pos.get("last_managed_ts", -1)), side="right"))
+            for i in range(start, int(ats.shape[0])):
+                bar_ts = int(ats[i])
+                nxt = (float(arrs["next_open"][i]), float(arrs["next_high"][i]),
+                       float(arrs["next_low"][i]), float(arrs["next_close"][i]))
+                if (i == int(ats.shape[0]) - 1
+                        and not all(math.isfinite(v) for v in nxt)):
+                    break   # execution bar not known yet — retry next run
+                # Interior NaN holes are manage_position's business: no
+                # fills off NaN bars, but a session-last force close still
+                # fires (no position survives a session boundary).
+                pos["last_managed_ts"] = bar_ts
+                rec = manage_position(
+                    pos, *nxt, self._session_last_bar(arrs, i),
+                    self.fees_frac, self.slip_frac, exit_ts=bar_ts + 60)
+                if rec is not None:
+                    self._apply_close(state, ticker, rec)
+                    self._emit("order", {"action": "exit",
+                                         "trade": asdict(rec)})
+                    n_events += 1
+                    break  # position closed — nothing left to manage
 
         # per-position mark events
         for ticker, pos in positions.items():
@@ -243,8 +272,7 @@ class PaperTrader:
             })
             n_events += 1
             if not decision.approved or decision.qty <= 0:
-                reasons = " ".join(decision.reasons).lower()
-                if any(m in reasons for m in _HALT_MARKERS):
+                if self._is_halt(decision):
                     self._emit("halt", {"ticker": ticker,
                                         "signal_id": sig.signal_id,
                                         "reasons": list(decision.reasons)})
@@ -319,6 +347,23 @@ class PaperTrader:
     # Internals
     # ------------------------------------------------------------------ #
 
+    def _is_halt(self, decision) -> bool:
+        """Is this rejection a circuit-breaker HALT (vs a mere size veto)?
+
+        Detected STRUCTURALLY: the risk manager's own ``state["halted"]``
+        flag (``aether.execution.risk.RiskManager.state``) is authoritative.
+        Only for duck-typed managers without that surface do we fall back to
+        the breaker rejection line's structured prefix — never to loose
+        substring matching, which previously fired on the breaker's PASS
+        line ("... above the −2.00% halt threshold") in every ordinary
+        rejection.
+        """
+        state = getattr(self.risk, "state", None)
+        if isinstance(state, dict) and "halted" in state:
+            return bool(state["halted"])
+        return any(str(r).strip().lower().startswith(_HALT_REJECT_PREFIX)
+                   for r in getattr(decision, "reasons", []) or [])
+
     def _sync_lake(self) -> None:
         """Incremental lake top-up (bars only). Failure = warn and carry on
         with the existing lake; a sync outage must not stop marking."""
@@ -385,11 +430,15 @@ class PaperTrader:
             "fee": entry_fee, "signal_id": sig.signal_id,
             "stop_px": stop, "target_px": target, "bar_ts": bar_ts,
         })
-        # conservative same-bar exit check on the entry bar (as in backtests)
+        # Conservative same-bar exit check on the entry bar (as in
+        # backtests). After a MAKER (limit) fill the same-bar TARGET is not
+        # credited — the bar's favorable extreme may predate the fill; the
+        # same-bar stop stays active (see manage_position).
         rec = manage_position(
             pos, o, h, l, float(arrs["next_close"][i]),
             self._session_last_bar(arrs, i), self.fees_frac, self.slip_frac,
-            exit_ts=bar_ts + 60, entry_bar=True)
+            exit_ts=bar_ts + 60, entry_bar=True,
+            allow_target=order["order_type"] != "limit")
         if rec is not None:
             self._apply_close(state, ticker, rec)
             self._emit("order", {"action": "exit", "trade": asdict(rec)})
@@ -410,12 +459,16 @@ class PaperTrader:
 
     @staticmethod
     def _newest_mark(arrs: dict[str, np.ndarray]) -> float | None:
-        """Newest known close: the last anchor's next bar close when finite,
-        else the anchor close itself."""
-        for v in (arrs["next_close"][-1], arrs["close_px"][-1]):
-            if math.isfinite(float(v)):
-                return float(v)
-        return None
+        """Newest COMPLETED close: the last anchor's own ``close_px``.
+
+        The newest anchor's ``next_*`` is NaN on a live store — precompute
+        cannot know a bar that has not printed yet — so the anchor close is
+        the freshest honest mark. (For the same reason position management
+        runs one bar behind the newest anchor: the documented one-bar
+        operational lag of the paper loop.)
+        """
+        v = float(arrs["close_px"][-1])
+        return v if math.isfinite(v) else None
 
     @staticmethod
     def _session_last_bar(arrs: dict[str, np.ndarray], i: int) -> bool:

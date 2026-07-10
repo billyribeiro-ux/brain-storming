@@ -32,7 +32,11 @@ Within one ``step`` call at pointer ``t``, per env, in this exact order:
    intent in force is ``hunt_long``/``hunt_short`` and the env is flat)
    fills at ``next_open ± slippage_bps`` (against the agent: longs buy
    higher, shorts sell lower), pays ``fees_bps``, and sizes
-   ``qty = size · max_position_frac · equity / fill_px``. Stop and target
+   ``qty = floor(size · max_position_frac · equity / (fill_px · (1+fee)))``
+   — WHOLE shares only, aligned with the risk layer's whole-share
+   flooring, and fee-inclusive so an all-in entry can never drive cash
+   negative by the fee amount. An entry that cannot afford one whole
+   share plus its fee is a no-op. Stop and target
    prices are set at ``fill ∓/± frac · realized_range(t)``. ``'enter'``
    while the intent is ``stand_aside`` is a **no-op**: the meta controller
    owns the *license* to trade and the sub-policy cannot overrule it.
@@ -43,9 +47,15 @@ Within one ``step`` call at pointer ``t``, per env, in this exact order:
    entry-bar stop-out is chronologically possible and simulating it is the
    conservative choice). If BOTH the stop and the target are touched inside
    the bar, the **stop fills** (worst case — intra-bar ordering is
-   unknowable from OHLC). The stop is a market order: it fills at
-   ``stop_px ± slippage`` plus fees. The target is a resting limit order:
-   it fills AT ``target_px`` exactly, fees only, no slippage.
+   unknowable from OHLC). The stop is a market order: it fills at the
+   WORSE of the stop price and the bar's open (a bar that gaps through
+   the stop triggers it at the open, and the fill can be no better than
+   that first print), ± slippage, plus fees — matching
+   ``backtest.manage_position``. The same rule covers the entry-bar
+   corollary of a stop lying between the (slipped) entry fill and the
+   bar's open: it triggers immediately at ~the open. The target is a
+   resting limit order: it fills AT ``target_px`` exactly, fees only, no
+   slippage.
 3. **Policy exit.** ``trade='exit'`` on a position that survived step 2
    fills at ``next_open ± slippage`` (reason ``policy_exit``). Note the
    deliberate pessimism of the 2→3 order: when a stop/target touch and an
@@ -79,10 +89,14 @@ this env commits to SAME-STEP auto-reset — the semantics the PPO trainer
 and its reference MiniEnv assume: the step that finishes an episode returns
 ``done=True`` (exactly once, with the terminal reward including the
 hindsight bonus) and the *observation of a freshly sampled episode's first
-bar*. The next action therefore applies to the new episode, the trainer
-zeroes the recurrent carry at the boundary, and GAE masks the bootstrap
-with ``1 − done``. No env is ever inert: consumers that replay a fixed
-episode set (backtests) must stop reading an env's stream once it has
+bar*. The replacement episode is sampled from the POOL the last ``reset()``
+resolved (falling back to all episodes when reset was unrestricted):
+sessions are shorter than a 390-bar rollout, so every rollout crosses an
+episode boundary — resampling from all episodes here would silently defeat
+curriculum staging. The next action therefore applies to the new episode,
+the trainer zeroes the recurrent carry at the boundary, and GAE masks the
+bootstrap with ``1 − done``. No env is ever inert: consumers that replay a
+fixed episode set (backtests) must stop reading an env's stream once it has
 reported done.
 
 Every closed round-trip is emitted as a
@@ -554,6 +568,9 @@ class TradingEnv:
         self._meta = np.full(n, _META_STAND_ASIDE, dtype=np.int64)
         self._trades: list[list[TradeRecord]] = [[] for _ in range(n)]
         self._was_reset = False
+        #: Episode-id pool resolved by the last reset(); same-step
+        #: auto-reset resamples replacements from it (None = all episodes).
+        self._pool: Optional[np.ndarray] = None
 
         logger.info("TradingEnv: %d episodes across %d tickers, D=%d, "
                     "n_envs=%d", len(self._episodes),
@@ -640,6 +657,7 @@ class TradingEnv:
         """
         m = len(self._episodes)
         if episode_ids is None:
+            self._pool = None  # unrestricted: auto-reset samples everything
             ids = self._rng.choice(m, size=self.n_envs,
                                    replace=self.n_envs > m)
         else:
@@ -675,6 +693,11 @@ class TradingEnv:
             if int(ids.min()) < 0 or int(ids.max()) >= m:
                 raise ValueError(
                     f"reset: episode ids must lie in [0, {m}), got {ids}")
+            # Remember the resolved pool: same-step auto-reset (see step())
+            # must resample replacement episodes from THIS pool, not from
+            # all episodes, or curriculum staging silently evaporates at
+            # the first episode boundary of every rollout.
+            self._pool = ids.copy()
             if ids.shape != (self.n_envs,):
                 # A pool, not a pinning: sample n_envs episodes from it.
                 ids = self._rng.choice(ids, size=self.n_envs,
@@ -723,8 +746,16 @@ class TradingEnv:
                 dones[i] = True
                 # SAME-STEP AUTO-RESET (see module docstring): the returned
                 # obs for this env is the first bar of a freshly sampled
-                # episode; done=True marks the boundary exactly once.
-                self._reset_one(i, int(self._rng.integers(m)))
+                # episode; done=True marks the boundary exactly once. The
+                # replacement is drawn from the pool the last reset()
+                # resolved (curriculum stage); only an unrestricted reset
+                # samples from all episodes.
+                if self._pool is not None and self._pool.size:
+                    nxt = int(self._pool[int(self._rng.integers(
+                        self._pool.size))])
+                else:
+                    nxt = int(self._rng.integers(m))
+                self._reset_one(i, nxt)
         return EnvStep(obs=self._obs(), reward=rewards,
                        done=dones, info=infos)
 
@@ -751,9 +782,15 @@ class TradingEnv:
                 and intent != _META_STAND_ASIDE and math.isfinite(nxt_o)):
             d = 1.0 if intent == _META_HUNT_LONG else -1.0
             fill_px = nxt_o * (1.0 + d * self._slip)   # against the agent
-            qty_abs = (float(a["size"]) * self.cfg.max_position_frac
-                       * prev_equity / fill_px)
-            if qty_abs > 0.0:
+            # Whole shares only (aligned with risk.py's whole-share floor),
+            # sized so notional PLUS the entry fee fits inside the budget —
+            # a fractional all-in entry used to drive cash negative by
+            # exactly the fee. An entry that cannot afford one whole share
+            # plus its fee is rejected (no-op).
+            qty_abs = float(math.floor(
+                float(a["size"]) * self.cfg.max_position_frac
+                * prev_equity / (fill_px * (1.0 + self._fee))))
+            if qty_abs >= 1.0:
                 fee = self._fee * qty_abs * fill_px
                 self._cash[i] -= d * qty_abs * fill_px
                 self._cash[i] -= fee
@@ -783,7 +820,16 @@ class TradingEnv:
                 stop_hit = nxt_h >= self._stop_px[i]
                 target_hit = nxt_l <= self._target_px[i]
             if stop_hit:      # stop-before-target: worst case wins
-                px = self._stop_px[i] * (1.0 - d * self._slip)  # market order
+                # A stop is a MARKET order: when the bar OPENS beyond the
+                # stop (gap through), the trigger fires at the open and the
+                # fill can be no better than that first print — take the
+                # WORSE of the stop price and the bar's open, matching
+                # backtest.manage_position. This also covers the entry-bar
+                # corollary: a stop lying between the (slipped) entry fill
+                # and the bar's open triggers immediately at ~the open.
+                raw = (min(self._stop_px[i], nxt_o) if d > 0.0
+                       else max(self._stop_px[i], nxt_o))
+                px = raw * (1.0 - d * self._slip)               # market order
                 self._close_position(i, px, fill_ts, t + 1, "stop", info)
             elif target_hit:  # resting limit: fills AT the level, fees only
                 self._close_position(i, float(self._target_px[i]), fill_ts,
@@ -961,6 +1007,13 @@ class TradingEnv:
             portfolio[i, 1] = (equity - self._eq0) / self._eq0
             portfolio[i, 2] = max(0.0, self._peak[i] - equity) / self._eq0
             clock[i, 0] = float(ep.minute[t]) / MINUTES_PER_SESSION
+            # clock[1] counts bars remaining in THIS EPISODE'S ARRAY, not
+            # in the calendar session: on truncated sessions (data holes,
+            # early closes indexed short, synthetic fixtures) the two can
+            # differ. Documented skew, kept deliberately — the env replays
+            # what the store holds, and bars the store lacks are also bars
+            # the agent could never trade; clock[0] carries the calendar
+            # position for policies that need wall-clock context.
             clock[i, 1] = float(ep.length - 1 - t) / MINUTES_PER_SESSION
             meta[i, int(self._meta[i])] = 1.0
             flags[i, 0] = 1.0 if t % self.cfg.meta_every == 0 else 0.0
