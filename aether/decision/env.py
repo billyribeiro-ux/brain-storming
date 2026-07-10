@@ -649,17 +649,29 @@ class TradingEnv:
                          for i, e in enumerate(self._episodes)}
                 self._episode_index = index
             pool: list[int] = []
+            unknown = 0
             for e in episode_ids:
                 if isinstance(e, (tuple, list)) and len(e) == 2:
                     key = (str(e[0]), str(e[1]))
                     if key not in index:
-                        raise ValueError(f"reset: unknown episode {key!r}")
+                        # The caller (e.g. a curriculum built over the whole
+                        # embeddings dir) may offer episodes outside this
+                        # env's date window. The env's episode universe is
+                        # authoritative: drop them, warn once per reset.
+                        unknown += 1
+                        continue
                     pool.append(index[key])
                 else:
                     pool.append(int(e))
+            if unknown:
+                logger.warning(
+                    "reset: dropped %d episode ids outside this env's "
+                    "universe (%d remain)", unknown, len(pool))
             ids = np.asarray(pool, dtype=np.int64)
             if ids.size == 0:
-                raise ValueError("reset: episode_ids is empty")
+                raise ValueError(
+                    "reset: no requested episode ids exist in this env "
+                    "(check start/end windows of env vs caller)")
             if int(ids.min()) < 0 or int(ids.max()) >= m:
                 raise ValueError(
                     f"reset: episode ids must lie in [0, {m}), got {ids}")
