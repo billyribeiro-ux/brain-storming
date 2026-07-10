@@ -74,10 +74,19 @@ def _observed(d: date) -> date | None:
     return d
 
 
+#: One-off full-day closures that no rule can predict (proclamations,
+#: catastrophes). Verified against the lake: 2025-01-09 was the National Day
+#: of Mourning for President Carter — every US equity venue closed. Extend
+#: this set when history demands it.
+SPECIAL_CLOSURES: frozenset[date] = frozenset({
+    date(2025, 1, 9),
+})
+
+
 @lru_cache(maxsize=64)
 def nyse_holidays(year: int) -> frozenset[date]:
-    """Full-day market closures for a given year."""
-    days: set[date] = set()
+    """Full-day market closures for a given year (rules + special closures)."""
+    days: set[date] = {d for d in SPECIAL_CLOSURES if d.year == year}
 
     for fixed in (
         date(year, 1, 1),                              # New Year's Day
