@@ -254,6 +254,11 @@ class PaperTrader:
                                         bar_ts)
 
         # ---- portfolio mark, persist ---------------------------------------- #
+        # Re-mark everything (positions opened this run were marked at their
+        # entry price) so the persisted equity is against the newest close.
+        for ticker, pos in positions.items():
+            if ticker in marks:
+                pos["mark"] = marks[ticker]
         equity = self._equity(state)
         state["equity"] = equity
         summary = {
