@@ -1,7 +1,7 @@
 /**
  * Zod schemas for every payload crossing the Python bridge.
  *
- * These mirror the dataclass contracts in `aether/*/interfaces.py` — the
+ * These mirror the dataclass contracts in `aether/<layer>/interfaces.py` — the
  * Python side is the source of truth; anything the bridge emits is parsed
  * (never blindly trusted) so a contract drift fails loudly in dev instead
  * of rendering NaNs in production.
