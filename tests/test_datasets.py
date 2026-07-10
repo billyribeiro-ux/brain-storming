@@ -23,7 +23,6 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import pytest
 import torch
@@ -31,6 +30,7 @@ import torch
 from aether.config import TICKER_IDS
 from aether.perception.datasets import PerceptionWindowDataset, collate_batch
 from aether.perception.interfaces import (
+    FEATURE_COLUMNS_BAR,
     N_BAR_FEATURES,
     N_DAILY_FEATURES,
     PerceptionBatch,
@@ -239,14 +239,16 @@ class TestGlobalInvariants:
 
     def test_anchor_bar_clock_features_match_minute_of_day(self, dataset) -> None:
         # The newest 1m feature row is the anchor bar itself; its tod_sin/cos
-        # channels (indices 8/9 of FEATURE_COLUMNS_BAR) must encode the same
-        # session minute the batch reports for that position.
+        # channels must encode the same session minute the batch reports for
+        # that position — this cross-checks feature/window alignment.
+        i_sin = FEATURE_COLUMNS_BAR.index("tod_sin")
+        i_cos = FEATURE_COLUMNS_BAR.index("tod_cos")
         b = collate_all(dataset)
         sm = b.minute_of_day[:, -1].to(torch.float64)
         angle = 2.0 * math.pi * sm / 390.0
-        assert torch.allclose(b.bars_1m[:, -1, 8].to(torch.float64),
+        assert torch.allclose(b.bars_1m[:, -1, i_sin].to(torch.float64),
                               torch.sin(angle), atol=1e-4)
-        assert torch.allclose(b.bars_1m[:, -1, 9].to(torch.float64),
+        assert torch.allclose(b.bars_1m[:, -1, i_cos].to(torch.float64),
                               torch.cos(angle), atol=1e-4)
 
 

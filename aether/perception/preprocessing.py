@@ -488,17 +488,35 @@ class TickerStats:
     # Persistence
     # ------------------------------------------------------------------ #
 
-    def to_json(self, path: Path | str) -> None:
-        """Serialize to a human-inspectable JSON file (atomic replace)."""
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(self), indent=2))
-        tmp.replace(path)
+    def to_json(self, path: Path | str | None = None) -> str:
+        """Serialize to human-inspectable JSON.
+
+        With ``path`` given, writes the JSON to that file via an atomic
+        replace (temp file + rename) so a crash never leaves a truncated
+        stats cache behind.  The serialized payload is returned either way,
+        which makes purely in-memory round trips (``from_json(to_json())``)
+        possible without touching disk.
+        """
+        payload = json.dumps(asdict(self), indent=2)
+        if path is not None:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(payload)
+            tmp.replace(path)
+        return payload
 
     @classmethod
-    def from_json(cls, path: Path | str) -> "TickerStats":
-        return cls(**json.loads(Path(path).read_text()))
+    def from_json(cls, source: Path | str) -> "TickerStats":
+        """Deserialize from a JSON file path OR a raw JSON payload string.
+
+        A raw payload (as returned by :meth:`to_json`) always starts with
+        ``{`` after stripping whitespace, which can never be a valid file
+        path — so the two forms are unambiguous.
+        """
+        if isinstance(source, str) and source.lstrip().startswith("{"):
+            return cls(**json.loads(source))
+        return cls(**json.loads(Path(source).read_text()))
 
 
 # --------------------------------------------------------------------------- #
