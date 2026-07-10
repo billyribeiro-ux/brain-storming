@@ -36,8 +36,9 @@ and improves itself relentlessly — especially from its losses.
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-This repository currently implements **layers 0–1**. Higher layers land
-module by module on top of the `PerceptionOutput` contract.
+All seven layers are implemented. Layers 0–1 are the load-bearing
+foundation; layers 2–6 are first-generation implementations, adversarially
+audited and hardened (see "Honesty notes").
 
 ### Layer 0 — Data (`aether/data/`)
 
@@ -127,24 +128,73 @@ python3 scripts/train_perception.py \
 python3 -m pytest tests/ -q       # the invariant suite
 ```
 
+## Layer guide (2–6)
+
+* **World model** (`aether/worldmodel/`) — action-free RSSM latent dynamics
+  (imagination rollouts for counterfactual simulation; honest by design:
+  our order flow does not move these instruments), NOTEARS-style lagged
+  causal graphs with bootstrap edge confidence, ring-buffer memory with
+  outcome-tagged analogs (as-of + 30-min embargo on retrieval), and
+  forensic trade autopsies: counterfactual variants replayed against real
+  bars, verdict taxonomy (`good_loss`/`bad_loss`/`good_win`/`lucky_win`),
+  lessons appended for training consumers.
+* **Decision core** (`aether/decision/`) — `EmbeddingStore` (frozen
+  perception → per-ticker npz replay), the conservative trading env
+  (decisions at t fill at t+1; stop fills at the worse of stop and open;
+  stop-before-target intrabar; whole-share fee-inclusive entries; eod
+  force-close; same-step auto-reset honoring the curriculum pool),
+  hierarchical policy (meta intent + Beta-distributed size/stop/target),
+  sequence-preserving recurrent PPO with exact resume, hindsight mining,
+  reversal-clarity curriculum.
+* **Meta-evolution** (`aether/evolution/`) — 20-gene config-genome search,
+  EWC anti-forgetting (true per-sample Fisher path), dream phase (value
+  consistency on imagined latents; provably cannot train action heads),
+  six-check self-diagnosis over run artifacts.
+* **Signals/risk/execution** (`aether/execution/`) — consensus conviction
+  (policy × imagination agreement × embargoed analogs, uncertainty
+  abstention gates, full `EvidenceBundle` audit trail + template rationale
+  from computed evidence only), hard-rail risk (sticky circuit breaker,
+  per-trade risk sizing, correlation haircut), event-driven backtester
+  (no same-bar re-entry after stops, session-boundary force-close,
+  automatic loss autopsies), taker/maker tactics, paper trader that
+  replays every missed bar (downtime cannot walk past stops).
+* **Dashboard** (`aether/dashboard/`) — `streamlit run aether/dashboard/app.py`:
+  overview, candles with signal/trade/saliency overlays, causal brain,
+  imagination playground, autopsy browser, paper blotter, feedback →
+  lessons pipeline, training curves + self-diagnosis.
+
 ## Roadmap
 
 | Module | Status |
 |---|---|
-| 0. FMP data pipeline (bars, news, fundamentals, macro) | ✅ this release |
-| 1. Perception: encoders, DNA, uncertainty, anomaly | ✅ this release |
-| 2. World model: causal graphs, counterfactuals, autopsies | next |
-| 3. Hierarchical meta-RL decision core | planned |
-| 4. Meta-learning & self-evolution (NAS, continual learning) | planned |
-| 5. Signal/risk/execution layer | planned |
-| 6. Streamlit dashboard & human feedback | planned |
+| 0. FMP data pipeline (bars, news, fundamentals, macro) | ✅ |
+| 1. Perception: encoders, DNA, uncertainty, anomaly | ✅ |
+| 2. World model: dynamics, causal graphs, memory, autopsies | ✅ v1 |
+| 3. Hierarchical RL decision core (env, PPO, curriculum) | ✅ v1 |
+| 4. Meta-evolution (genome search, EWC, dreams, diagnosis) | ✅ v1 |
+| 5. Signals, risk, backtest, tactics, paper trading | ✅ v1 |
+| 6. Streamlit dashboard & human feedback | ✅ v1 |
 | Options flow & surfaces | blocked on data plan (auto-enables via probe) |
+| GPU-scale training, meta-controller depth, live NAS loops | next iterations |
 
 ## Honesty notes
 
 * Options-flow decoding is registered but **not active** — the current FMP
   plan returns 404 for options endpoints. The capability probe records this;
   upgrading the plan activates ingestion with no code changes.
-* Perception embeddings are trained self-supervised; they become *tradable*
-  only once the world model and decision core (next modules) sit on top.
-  Nothing in this release emits trade signals yet — by design.
+* Layers 2–6 are **first-generation**: every architectural organ exists,
+  is tested (213-test suite incl. look-ahead batteries and hand-computed
+  fill math), was adversarially audited by independent review passes
+  (look-ahead, RL math, accounting realism — 18 findings applied), and runs
+  end-to-end on the real lake. What they are NOT yet is *converged*:
+  checkpoints in this repo come from short CPU validation runs, not
+  GPU-scale training. Treat any backtest numbers as machinery proof, not
+  alpha claims.
+* Dream phases train value consistency only (no imagined prices → no
+  imagined PnL) until a price decoder is added to the world model.
+* Signal rationales are template-composed from real computed evidence
+  (attribution, causal drivers, analogs, uncertainty) — not free-form
+  generation, and honest about being so.
+* The paper trader writes an order blotter; **no broker integration
+  exists anywhere** — live capital requires explicit human integration by
+  design.
