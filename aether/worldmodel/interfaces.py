@@ -39,7 +39,7 @@ class DynamicsConfig:
     stoch_dim: int = 32        # stochastic latent (diagonal Gaussian)
     hidden_dim: int = 192
     kl_beta: float = 1.0
-    free_nats: float = 1.0     # KL below this per-dim is not penalized
+    free_nats: float = 1.0     # per-STEP budget on the dim-summed KL (Dreamer convention)
     horizon: int = 30          # default imagination depth (bars)
 
 

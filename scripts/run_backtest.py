@@ -91,7 +91,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # brains: missing components mean fewer evidence sources, never a crash.
 # --------------------------------------------------------------------------- #
 
-def load_policy(ckpt_path: str | None):
+def check_provenance(component: str, train_range: dict | None,
+                     bt_start: str, bt_end: str) -> None:
+    """Warn LOUDLY when a component's training/fitting range cannot be
+    verified against — or overlaps — the backtest window.
+
+    * Absent metadata → "PROVENANCE UNVERIFIED": older artifacts predate
+      the embedded ``train_range`` fields (loads stay backward-tolerant),
+      but the operator must know the in-sample check never actually ran.
+    * Overlap → "PROVENANCE OVERLAP": the component saw the backtest
+      window during training/fitting, so the results are in-sample.
+
+    Empty-string bounds mean unbounded (which always overlaps). ISO
+    YYYY-MM-DD strings compare lexicographically == chronologically.
+    """
+    window = f"[{bt_start or '-inf'}, {bt_end or '+inf'}]"
+    start = str((train_range or {}).get("start") or "")
+    end = str((train_range or {}).get("end") or "")
+    if not (start or end):
+        logger.warning(
+            "PROVENANCE UNVERIFIED: %s carries no training-range metadata — "
+            "cannot confirm it was not trained on the backtest window %s. "
+            "Re-save it with a current trainer to embed train_range.",
+            component, window)
+        return
+    lo = max(start or "0000-00-00", bt_start or "0000-00-00")
+    hi = min(end or "9999-99-99", bt_end or "9999-99-99")
+    if lo <= hi:
+        logger.warning(
+            "PROVENANCE OVERLAP: %s was trained/fitted on [%s, %s], which "
+            "overlaps the backtest window %s — these results are IN-SAMPLE.",
+            component, start or "-inf", end or "+inf", window)
+    else:
+        logger.info("provenance ok: %s trained on [%s, %s], disjoint from %s",
+                    component, start or "-inf", end or "+inf", window)
+
+
+def load_policy(ckpt_path: str | None, bt_start: str = "", bt_end: str = ""):
     """Policy from a checkpoint, or None. Tolerates the checkpoint layout
     (state under 'policy'/'model'/'state_dict' or the raw dict) and builds
     the config from any 'policy_cfg'/'cfg' snapshot it finds."""
@@ -113,6 +149,8 @@ def load_policy(ckpt_path: str | None):
         return None
     try:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        check_provenance(f"policy checkpoint {path}",
+                         ckpt.get("train_range"), bt_start, bt_end)
         cfg_snap = ckpt.get("policy_cfg") or ckpt.get("cfg") or {}
         field_names = {f.name for f in dataclasses.fields(PolicyConfig)}
         pcfg = PolicyConfig(**{k: v for k, v in dict(cfg_snap).items()
@@ -134,7 +172,7 @@ def load_policy(ckpt_path: str | None):
         return None
 
 
-def load_dynamics():
+def load_dynamics(bt_start: str = "", bt_end: str = ""):
     """Latent dynamics from the first checkpoint found in the usual spots,
     or None (module missing, no artifact, or incompatible layout)."""
     candidates = [
@@ -169,6 +207,8 @@ def load_dynamics():
                            "dynamics=None")
             return None
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        check_provenance(f"dynamics checkpoint {ckpt_path}",
+                         ckpt.get("train_range"), bt_start, bt_end)
         cfg_snap = ckpt.get("cfg") or {}
         field_names = {f.name for f in dataclasses.fields(DynamicsConfig)}
         dcfg = DynamicsConfig(**{k: v for k, v in dict(cfg_snap).items()
@@ -207,7 +247,7 @@ def load_memory(data_root: Path):
         return None
 
 
-def load_causal(data_root: Path):
+def load_causal(data_root: Path, bt_start: str = "", bt_end: str = ""):
     """Newest causal graph snapshot json, or None."""
     causal_dir = Path(data_root) / "causal"
     snaps = sorted(causal_dir.glob("*.json")) if causal_dir.exists() else []
@@ -217,6 +257,10 @@ def load_causal(data_root: Path):
     try:
         from aether.worldmodel import causal as causal_mod
         snapshot = causal_mod.from_json(snaps[-1].read_text())
+        fitted = {"start": getattr(snapshot, "fitted_start", ""),
+                  "end": getattr(snapshot, "fitted_end", "")}
+        check_provenance(f"causal snapshot {snaps[-1]}", fitted,
+                         bt_start, bt_end)
         logger.info("causal graph loaded from %s", snaps[-1])
         return snapshot
     except Exception as exc:
@@ -260,20 +304,23 @@ def build_autopsist(data_root: Path):
 
 
 def build_signal_engine(aether_cfg: AetherConfig, embeddings_dir: str,
-                        policy=None, perception_ckpt: str | None = None):
+                        policy=None, perception_ckpt: str | None = None,
+                        bt_start: str = "", bt_end: str = ""):
     """Assemble ``aether.execution.signals.SignalEngine`` adaptively.
 
     Constructor arguments are bound by parameter name against a synonym
     table (house style — the module is developed concurrently), so the
     engine receives exactly the components it declares: any of policy /
-    dynamics / memory / causal it asks for arrives loaded-or-None.
+    dynamics / memory / causal it asks for arrives loaded-or-None. The
+    backtest window (``bt_start``/``bt_end``) feeds the provenance guards
+    on every artifact loaded here.
     """
     from aether.execution.signals import SignalEngine  # concurrent module
 
     data_root = Path(aether_cfg.data.root)
-    dynamics = load_dynamics()
+    dynamics = load_dynamics(bt_start, bt_end)
     memory = load_memory(data_root)
-    causal = load_causal(data_root)
+    causal = load_causal(data_root, bt_start, bt_end)
     sig_cfg = SignalConfig()
     candidates = {
         "cfg": sig_cfg, "config": sig_cfg, "signal_cfg": sig_cfg,
@@ -341,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
         initial_equity=args.initial_equity,
         autopsy_losses=not args.no_autopsy)
 
-    policy = load_policy(args.policy_ckpt)
+    policy = load_policy(args.policy_ckpt, args.start, args.end)
     if args.mode == "policy" and policy is None:
         print("error: --mode policy requires a loadable --policy-ckpt",
               file=sys.stderr)
@@ -352,7 +399,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             signal_engine = build_signal_engine(
                 cfg, args.embeddings_dir, policy=policy,
-                perception_ckpt=args.perception_ckpt)
+                perception_ckpt=args.perception_ckpt,
+                bt_start=args.start, bt_end=args.end)
         except ImportError as exc:
             print(f"error: aether.execution.signals is not available yet "
                   f"({exc}); --mode signals needs it", file=sys.stderr)

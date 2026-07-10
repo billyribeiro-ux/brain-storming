@@ -74,6 +74,57 @@ class TestQuery:
         assert bank.query(np.ones(DIM, dtype=np.float32), k=8) == []
 
 
+class TestAsOfEmbargo:
+    """query(as_of=...) must exclude analogs whose outcome window overlaps
+    (or follows) the query moment — anchor_ts <= as_of - embargo_s only."""
+
+    def test_embargo_excludes_recent_and_future_analogs(self, tmp_path):
+        bank = memmod.MemoryBank(_cfg(tmp_path))
+        keys = _one_hots(6)
+        # anchors: 0, 600, 1200, ..., 3000 seconds
+        metas = [{"ticker": "AAPL", "anchor_ts": 600 * i,
+                  "outcome": {"fwd_ret_30m": 0.01}} for i in range(6)]
+        bank.add(keys, metas)
+
+        as_of = 3000
+        hits = bank.query(keys[5], k=6, as_of=as_of)  # default embargo 1800s
+        assert hits, "older analogs must remain retrievable"
+        cutoff = as_of - 1800
+        for h in hits:
+            assert h.anchor_ts <= cutoff, (
+                f"analog at {h.anchor_ts} leaked through the embargo "
+                f"(as_of={as_of}, cutoff={cutoff})")
+        # anchors 0, 600, 1200 survive; 1800, 2400, 3000 are embargoed
+        assert sorted(h.anchor_ts for h in hits) == [0, 600, 1200]
+
+        # the embargoed key itself (an EXACT match, cosine 1.0) must not be
+        # returned — similarity can never override the time filter
+        exact = bank.query(keys[4], k=1, as_of=as_of)
+        assert exact and exact[0].anchor_ts != metas[4]["anchor_ts"]
+
+    def test_custom_embargo_and_no_survivors(self, tmp_path):
+        bank = memmod.MemoryBank(_cfg(tmp_path))
+        keys = _one_hots(3)
+        metas = [{"ticker": "AAPL", "anchor_ts": 1000 + i,
+                  "outcome": {"fwd_ret_30m": 0.0}} for i in range(3)]
+        bank.add(keys, metas)
+        assert bank.query(keys[0], k=3, as_of=1002, embargo_s=1) == [
+        ] or all(h.anchor_ts <= 1001 for h in
+                 bank.query(keys[0], k=3, as_of=1002, embargo_s=1))
+        # nothing predates the cutoff -> honest empty result, not an error
+        assert bank.query(keys[0], k=3, as_of=500) == []
+
+    def test_as_of_none_keeps_hindsight_behavior(self, tmp_path):
+        """Offline consumers (autopsies) query with hindsight on purpose:
+        as_of=None must stay unfiltered."""
+        bank = memmod.MemoryBank(_cfg(tmp_path))
+        keys, metas = _one_hots(4), _metas(4)
+        bank.add(keys, metas)
+        hits = bank.query(keys[3], k=4)
+        assert len(hits) == 4
+        assert hits[0].anchor_ts == metas[3]["anchor_ts"]
+
+
 # --------------------------------------------------------------------------- #
 # capacity ring
 # --------------------------------------------------------------------------- #

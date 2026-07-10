@@ -79,6 +79,13 @@ class CurriculumSampler:
         Number of curriculum stages. Stage ``k`` (0-based) exposes the top
         ``(k + 1) / stages`` clarity quantile — the final stage exposes
         everything, so the curriculum biases *order*, never final coverage.
+    start / end:
+        Optional inclusive ISO session dates ("YYYY-MM-DD") restricting
+        which sessions are scored and ranked at all. Passing the trainer's
+        own --start/--end keeps the curriculum's universe identical to the
+        env's episode window — otherwise the sampler would offer episodes
+        the env must drop (and, worse, rank against sessions that are not
+        even in the training range).
 
     Episode ids are ``(ticker, "YYYY-MM-DD")`` tuples, matching the
     ``TradingEnv.episodes`` convention; ``TradingEnv.reset(episode_ids=...)``
@@ -90,6 +97,8 @@ class CurriculumSampler:
         embeddings_dir: str | Path,
         tickers: tuple[str, ...] | list[str],
         stages: int = 4,
+        start: str | None = None,
+        end: str | None = None,
     ) -> None:
         if stages < 1:
             raise ValueError(f"stages must be >= 1, got {stages}")
@@ -97,13 +106,16 @@ class CurriculumSampler:
         self.tickers = tuple(tickers)
         self.stages = int(stages)
         self.stage = 0
+        self.start = str(start) if start else None
+        self.end = str(end) if end else None
 
         scored = self._score_episodes()
         if not scored:
             raise FileNotFoundError(
                 f"CurriculumSampler found no episodes for tickers "
-                f"{self.tickers} under {self.embeddings_dir} — run the "
-                f"embedding precompute first")
+                f"{self.tickers} under {self.embeddings_dir} in "
+                f"[{self.start or '-inf'}, {self.end or '+inf'}] — run the "
+                f"embedding precompute first (or widen start/end)")
         # Rank by clarity (descending); deterministic tie-break on the id.
         scored.sort(key=lambda item: (-item[1], item[0]))
         self._ranked: list[tuple[str, str]] = [eid for eid, _ in scored]
@@ -146,6 +158,11 @@ class CurriculumSampler:
             for day in np.unique(days):
                 sel = days == day
                 date = str(np.datetime64(int(day), "D"))
+                # ISO dates compare lexicographically == chronologically.
+                if self.start and date < self.start:
+                    continue
+                if self.end and date > self.end:
+                    continue
                 score = reversal_clarity(closes[sel])
                 scored.append(((ticker, date), score))
         return scored

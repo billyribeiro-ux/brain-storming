@@ -117,6 +117,15 @@ class ExecutionTactics:
           ``L`` (no slippage, no improvement); a sell limit iff
           ``next_high >= L``. Unfilled ⇒ ``(False, None)`` — the order is
           cancelled, never carried to later bars.
+
+        KNOWN OPTIMISM (acknowledged, unmodeled): the limit rule is
+        touch-equals-fill. In reality a bar whose extreme merely TOUCHES
+        the limit price may not fill it — queue position and available
+        size at the level decide — so maker fill rates simulated here are
+        an upper bound. Downstream consumers (backtests, the paper
+        trader) already partially offset this by refusing same-bar target
+        credit after a maker fill; the residual optimism stands until a
+        queue model exists.
         """
         direction = 1.0 if side == "long" else -1.0
         if decision.get("order_type") == "limit":

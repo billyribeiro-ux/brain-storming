@@ -503,13 +503,18 @@ class PPOTrainer:
     def save(self, path: str | Path) -> None:
         """Write a complete, resumable snapshot (atomic temp-file + rename).
 
-        Includes every RNG stream (python/numpy/torch/cuda) so a resumed run
-        draws the *same* future action samples and minibatch permutations —
-        exact resume, not an approximation.
+        Includes every RNG stream (python/numpy/torch/cuda, plus the ENV's
+        own numpy Generator when the env exposes ``_rng``) so a resumed run
+        draws the *same* future action samples, minibatch permutations AND
+        episode draws — exact resume, not an approximation. Also embeds the
+        env's training date range (``train_range``) so downstream
+        provenance guards (scripts/run_backtest.py) can verify a policy was
+        not trained on the window it is being backtested over.
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         policy_cfg = getattr(self.policy, "cfg", None)
+        env_cfg = getattr(self.env, "cfg", None)
         payload: dict[str, Any] = {
             "update": self.update_idx,
             "best_reward": self.best_reward,
@@ -519,6 +524,11 @@ class PPOTrainer:
             "cfg": dataclasses.asdict(self.cfg),
             "policy_cfg": (dataclasses.asdict(policy_cfg)
                            if dataclasses.is_dataclass(policy_cfg) else None),
+            # Provenance: the episode window the env trained on (empty
+            # strings mean "unbounded"; None means the env exposed no cfg).
+            "train_range": ({"start": str(getattr(env_cfg, "start", "")),
+                             "end": str(getattr(env_cfg, "end", ""))}
+                            if env_cfg is not None else None),
             "rng": {
                 "python": random.getstate(),
                 "numpy": np.random.get_state(),
@@ -527,6 +537,13 @@ class PPOTrainer:
                          if torch.cuda.is_available() else []),
             },
         }
+        # The env's episode-sampling Generator: without it a resumed run
+        # replays training on a different episode sequence than the
+        # uninterrupted run would have seen (the exact-resume claim).
+        env_rng = getattr(self.env, "_rng", None)
+        bit_gen = getattr(env_rng, "bit_generator", None)
+        if bit_gen is not None:
+            payload["rng"]["env"] = bit_gen.state
         tmp = path.with_name(path.name + ".tmp")
         torch.save(payload, tmp)
         os.replace(tmp, path)  # atomic on POSIX
@@ -553,6 +570,19 @@ class PPOTrainer:
             torch.set_rng_state(rng["torch"])
         if rng.get("cuda") and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(rng["cuda"])
+        # Env episode-sampling RNG (backward-tolerant: absent in snapshots
+        # written before it was recorded — those resume with the env's
+        # constructor-seeded stream and a warning).
+        env_rng = getattr(self.env, "_rng", None)
+        bit_gen = getattr(env_rng, "bit_generator", None)
+        if "env" in rng and bit_gen is not None:
+            bit_gen.state = rng["env"]
+        elif bit_gen is not None:
+            self.logger.warning(
+                "resume: checkpoint carries no env RNG state — episode "
+                "sampling continues from the env's constructor seed, so "
+                "the episode sequence will differ from the uninterrupted "
+                "run")
 
         saved_cfg = ckpt.get("cfg", {})
         live_cfg = dataclasses.asdict(self.cfg)

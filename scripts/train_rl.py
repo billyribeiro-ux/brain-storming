@@ -105,7 +105,10 @@ def main(argv: list[str] | None = None) -> int:
     env = TradingEnv(env_cfg, n_envs=args.n_envs)
 
     # ---- Curriculum ----------------------------------------------------------
-    sampler = CurriculumSampler(args.embeddings_dir, tickers)
+    # The sampler's session universe is pinned to the training window so it
+    # ranks and offers exactly the episodes the env can replay.
+    sampler = CurriculumSampler(args.embeddings_dir, tickers,
+                                start=args.start, end=args.end)
     print(f"curriculum: {len(sampler)} episodes across {len(tickers)} "
           f"tickers, {sampler.stages} stages")
 

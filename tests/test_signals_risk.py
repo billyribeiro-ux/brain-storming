@@ -128,6 +128,48 @@ class TestSignalEmission:
         assert isinstance(ev.analogs_summary, list)
 
 
+class RecordingDictPolicy:
+    """HierarchicalPolicy-shaped (dict) mode() that records every obs it is
+    shown — pins the two-pass policy query."""
+
+    def __init__(self):
+        self.seen: list[dict] = []
+
+    def mode(self, obs, carry=None):
+        self.seen.append({k: torch.as_tensor(v).clone()
+                          for k, v in obs.items()})
+        b = int(torch.as_tensor(obs["market"]).shape[0])
+        return {
+            "meta": torch.ones(b, dtype=torch.long),          # hunt_long
+            "trade": torch.ones(b, dtype=torch.long),         # enter
+            "meta_probs": torch.tensor([[0.1, 0.8, 0.1]]).repeat(b, 1),
+            "trade_probs": torch.tensor([[0.1, 0.7, 0.1, 0.1]]).repeat(b, 1),
+            "size_mean": torch.full((b,), 0.5),
+            "stop_mean": torch.full((b,), 0.5),
+            "target_mean": torch.full((b,), 0.5),
+        }
+
+
+class TestTwoPassPolicyQuery:
+    def test_enter_prob_is_queried_with_the_intent_in_force(self, emb):
+        """policy_prob must be p(intent) from a neutral meta-decision state
+        times p(enter) from the state where the chosen intent is IN FORCE
+        (flags=0, intent one-hot) — the env gates entries on the
+        pre-update intent, so pass 1's trade head is reward-inert noise."""
+        pol = RecordingDictPolicy()
+        sig = _engine(policy=pol).generate("AAPL", IDX, emb)
+        assert sig is not None and sig.side == "long"
+        assert len(pol.seen) == 2, "exactly two policy passes expected"
+        o1, o2 = pol.seen
+        # pass 1: meta-decision bar, neutral stand_aside prior
+        assert float(o1["flags"][0, 0]) == pytest.approx(1.0)
+        assert int(torch.argmax(o1["meta"][0])) == 0          # stand_aside
+        # pass 2: intent in force, NOT a meta-decision bar
+        assert float(o2["flags"][0, 0]) == pytest.approx(0.0)
+        assert int(torch.argmax(o2["meta"][0])) == 1          # hunt_long
+        assert sig.evidence.policy_prob == pytest.approx(0.8 * 0.7)
+
+
 class TestAbstention:
     def _mutated(self, emb, key, value):
         out = dict(emb)

@@ -24,6 +24,12 @@ mattered, loose springs on the ones that never carried gradient:
 This estimator uses the caller's actual training loss rather than sampled
 model labels, i.e. the *empirical* Fisher — the standard, honest shortcut.
 
+The expectation above is over SAMPLES. :meth:`FisherRegularizer.snapshot`
+therefore computes the true diagonal only when its ``loss_fn`` returns
+per-sample losses (1-D ``[B]``); a scalar batch-mean loss can only yield
+the squared MEAN gradient, a ~1/B underestimate near convergence — see the
+``snapshot`` docstring for the exact contract and its limits.
+
 When to snapshot
 ----------------
 Call :meth:`FisherRegularizer.snapshot` on the CONVERGED model, using
@@ -91,21 +97,43 @@ class FisherRegularizer:
             The trained model to anchor. Left in its incoming train/eval
             mode; gradients are zeroed before returning.
         loss_fn:
-            Zero-argument callable returning the scalar training loss for
-            ONE batch of *old-regime* data (the caller closes over its data
-            iterator). It is called ``n_batches`` times; each call must
-            build a fresh graph over ``model``'s parameters.
+            Zero-argument callable returning the loss for ONE batch of
+            *old-regime* data (the caller closes over its data iterator).
+            It is called ``n_batches`` times; each call must build a fresh
+            graph over ``model``'s parameters. TWO contracts, chosen by the
+            returned tensor's shape:
+
+            * **1-D per-sample losses ``[B]``** — the CORRECT empirical
+              Fisher: ``F_i = E_samples[(∂ℓ/∂θ_i)²]`` is accumulated by
+              backpropagating each sample separately (a documented O(B)
+              backward cost per batch). Prefer this whenever your loss can
+              be computed per sample.
+            * **scalar (batch-mean) loss** — HONESTY WARNING, READ THIS:
+              a scalar path can only observe the batch-mean gradient, so
+              what gets accumulated is the SQUARED MEAN gradient
+              ``(E[∂ℓ/∂θ_i])²``, NOT the Fisher's mean of squares
+              ``E[(∂ℓ/∂θ_i)²]``. Around a converged optimum the mean
+              gradient is near zero while per-sample gradients are not, so
+              this UNDERESTIMATES the Fisher by roughly a factor of the
+              batch size B (empirically ~87x at B=64 on this stack). It is
+              retained because its *relative* magnitudes still rank
+              parameter importance usably — but it is only comparable
+              across snapshots taken with the SAME batch size, and the
+              resulting ``penalty()`` strength is not calibrated in
+              Fisher units. No silent rescaling is applied: multiplying by
+              B would fake a quantity that was never measured.
         n_batches:
-            Number of batches to average ``grad²`` over. More batches →
-            lower-variance Fisher. 32–128 is a sensible range (default 32).
+            Number of batches to average over. More batches →
+            lower-variance estimate. 32–128 is a sensible range (default
+            32).
 
         Notes
         -----
-        Accumulates ``F_i = (1/N) Σ_batches (∂L/∂θ_i)²`` per parameter into
-        CPU float32 buffers, plus a detached CPU copy of every parameter
-        (``θ*``). Parameters with ``requires_grad=False`` are excluded —
-        they cannot drift, so they need no spring. A parameter that never
-        receives a gradient keeps Fisher 0 (a free parameter, unpenalized).
+        Accumulates into CPU float32 buffers, plus a detached CPU copy of
+        every parameter (``θ*``). Parameters with ``requires_grad=False``
+        are excluded — they cannot drift, so they need no spring. A
+        parameter that never receives a gradient keeps Fisher 0 (a free
+        parameter, unpenalized).
         """
         if n_batches < 1:
             raise ValueError(f"n_batches must be >= 1, got {n_batches}")
@@ -113,14 +141,46 @@ class FisherRegularizer:
                  if p.requires_grad]
         fisher = {name: torch.zeros(p.shape, dtype=torch.float32, device="cpu")
                   for name, p in named}
+        used_scalar_path = False
         for _ in range(int(n_batches)):
             model.zero_grad(set_to_none=True)
             loss = loss_fn()
-            loss.backward()
-            for name, p in named:
-                if p.grad is not None:
-                    fisher[name] += p.grad.detach().float().pow(2).cpu()
+            if loss.dim() == 0:
+                # Scalar (batch-mean) path: accumulates the SQUARED MEAN
+                # gradient — see the loss_fn contract above for why this
+                # is a biased (≈1/B) stand-in for the true Fisher.
+                used_scalar_path = True
+                loss.backward()
+                for name, p in named:
+                    if p.grad is not None:
+                        fisher[name] += p.grad.detach().float().pow(2).cpu()
+            elif loss.dim() == 1:
+                # Per-sample path: the honest empirical Fisher
+                # F_i = mean_b (∂ℓ_b/∂θ_i)², one backward per sample.
+                bsz = int(loss.shape[0])
+                if bsz == 0:
+                    raise ValueError("loss_fn returned an empty per-sample "
+                                     "loss tensor")
+                for b in range(bsz):
+                    model.zero_grad(set_to_none=True)
+                    loss[b].backward(retain_graph=b < bsz - 1)
+                    for name, p in named:
+                        if p.grad is not None:
+                            fisher[name] += (p.grad.detach().float().pow(2)
+                                             .cpu() / float(bsz))
+            else:
+                raise ValueError(
+                    "loss_fn must return a scalar (batch-mean) loss or a "
+                    f"1-D per-sample loss tensor; got shape "
+                    f"{tuple(loss.shape)}")
         model.zero_grad(set_to_none=True)
+        if used_scalar_path:
+            self.logger.warning(
+                "EWC snapshot used the SCALAR loss path: the accumulated "
+                "quantity is the squared BATCH-MEAN gradient, ~1/B of the "
+                "true diagonal Fisher — comparable only across identical "
+                "batch sizes. Return per-sample losses from loss_fn for "
+                "the honest estimator.")
 
         self._fisher = {name: buf / float(n_batches)
                         for name, buf in fisher.items()}

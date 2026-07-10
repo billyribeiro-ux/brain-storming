@@ -320,13 +320,21 @@ def build_window_index(args: argparse.Namespace,
 # --------------------------------------------------------------------------- #
 
 def save_checkpoint(path: Path, model: RSSM, cfg: DynamicsConfig,
-                    step: int) -> None:
-    """Write ``{model, cfg, step}`` atomically (temp file + rename)."""
+                    step: int,
+                    train_range: dict[str, str] | None = None) -> None:
+    """Write ``{model, cfg, step, train_range}`` atomically (tmp + rename).
+
+    ``train_range`` ({"start", "end"} ISO dates, empty = unbounded) is
+    provenance metadata: downstream guards (scripts/run_backtest.py) use it
+    to warn when a dynamics model is evaluated on the window it was
+    trained on. Loaders must stay tolerant of its absence (older files).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "model": model.state_dict(),
         "cfg": dataclasses.asdict(cfg),
         "step": step,
+        "train_range": train_range,
     }
     tmp = path.with_name(path.name + ".tmp")
     torch.save(payload, tmp)
@@ -424,10 +432,14 @@ def main(argv: list[str] | None = None) -> int:
         # Checkpoint cadence (always fires on the final step): last.pt every
         # time, best.pt only on a new running-recon low.
         if step % checkpoint_every == 0 or step == args.steps:
-            save_checkpoint(checkpoint_dir / "last.pt", model, cfg, step)
+            train_range = {"start": str(args.start or ""),
+                           "end": str(args.end or "")}
+            save_checkpoint(checkpoint_dir / "last.pt", model, cfg, step,
+                            train_range=train_range)
             if running_recon < best_recon:
                 best_recon = running_recon
-                save_checkpoint(checkpoint_dir / "best.pt", model, cfg, step)
+                save_checkpoint(checkpoint_dir / "best.pt", model, cfg, step,
+                                train_range=train_range)
                 logger.info("step %d: new best recon_ema=%.4f -> best.pt",
                             step, best_recon,
                             extra={"aether_step": step,

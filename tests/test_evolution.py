@@ -195,6 +195,43 @@ class TestFisherRegularizer:
         assert p1 > 0.0
         assert np.isfinite(p1)
 
+    def test_per_sample_losses_give_the_true_diagonal_fisher(self):
+        """A 1-D per-sample loss_fn must yield F = mean_b (∂l_b/∂θ)² —
+        checked against a hand-computed value on a linear model — while
+        the scalar path yields the (squared-mean-gradient) ~1/B
+        underestimate it is documented to be."""
+        contmod = pytest.importorskip("aether.evolution.continual")
+        torch.manual_seed(1)
+        model = nn.Linear(4, 1, bias=False)
+        x = torch.randn(32, 4)
+
+        def per_sample_loss():
+            return (model(x).squeeze(-1)) ** 2          # [B]
+
+        def scalar_loss():
+            return (model(x).squeeze(-1) ** 2).mean()   # []
+
+        # Hand-computed: l_b = (w·x_b)², ∂l_b/∂w = 2 (w·x_b) x_b.
+        with torch.no_grad():
+            w = model.weight.squeeze(0)                 # [4]
+            per_grad = 2.0 * (x @ w).unsqueeze(1) * x   # [B, 4]
+            expected = per_grad.pow(2).mean(dim=0)      # [4]
+            expected_scalar = per_grad.mean(dim=0).pow(2)
+
+        reg = contmod.FisherRegularizer()
+        reg.snapshot(model, per_sample_loss, n_batches=1)
+        got = reg._fisher["weight"].squeeze(0)
+        torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-6)
+
+        reg_scalar = contmod.FisherRegularizer()
+        reg_scalar.snapshot(model, scalar_loss, n_batches=1)
+        got_scalar = reg_scalar._fisher["weight"].squeeze(0)
+        torch.testing.assert_close(got_scalar, expected_scalar,
+                                   rtol=1e-4, atol=1e-6)
+        # the scalar path is the documented ~1/B underestimate, never more
+        assert float(got_scalar.sum()) < float(got.sum()), \
+            "scalar (squared-mean) path must underestimate the true Fisher"
+
 
 # --------------------------------------------------------------------------- #
 # self-diagnosis on a crafted regressing run

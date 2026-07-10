@@ -10,9 +10,17 @@ Consensus design
 ----------------
 Three evidence sources are polled, each producing a value in [0, 1]:
 
-* ``policy_prob``            — the trained policy's own modal action
-                               probability (weight **2.0**: it is the only
-                               source trained end-to-end on the task),
+* ``policy_prob``            — the trained policy's own conviction,
+                               composed as p(intent) · p(enter | intent)
+                               over a TWO-PASS query: pass 1 asks the meta
+                               head for the intent on a neutral
+                               meta-decision bar; pass 2 asks the trade
+                               head for 'enter' with that intent one-hot
+                               IN FORCE (flags=0) — the state in which the
+                               env actually accepts an entry, since a
+                               fresh intent only takes force on the next
+                               bar (weight **2.0**: it is the only source
+                               trained end-to-end on the task),
 * ``imagination_agreement``  — fraction of world-model rollouts whose decoded
                                embedding drifts the signal's way (weight 1.0),
 * ``analog_winrate``         — 30-minute outcome agreement among the nearest
@@ -245,27 +253,49 @@ class SignalEngine:
         intent_name = ""
         p_intent = p_enter = float("nan")
         if self.policy is not None:
-            obs = self._build_obs(emb, fused_all, idx)
+            # PASS 1 — the meta head decides the INTENT from a neutral
+            # stance: flags=1 (a meta-decision bar), flat book, prior
+            # intent stand_aside.
+            obs1 = self._build_obs(emb, fused_all, idx)
             with torch.no_grad():
-                view = self._policy_view(self.policy.mode(obs))
-            intent = int(view["intent"])
+                view1 = self._policy_view(self.policy.mode(obs1))
+            intent = int(view1["intent"])
             intent_name = META_ACTIONS[intent]
-            p_intent = float(view["p_intent"])
+            p_intent = float(view1["p_intent"])
             if intent_name == "stand_aside":
                 return None, (f"policy intent: stand_aside is the modal "
                               f"intent (p={p_intent:.3f})")
             side = "long" if intent_name == "hunt_long" else "short"
-            if view["p_enter"] is None:
+
+            # PASS 2 — the trade head decides ENTER *under that intent*.
+            # Why two passes: TradingEnv gates 'enter' on the intent in
+            # force BEFORE the same bar's meta update (step order 1..5), so
+            # a freshly chosen intent only takes force on the NEXT bar. In
+            # pass 1's state (meta=stand_aside, flags=1) 'enter' is a
+            # reward-inert no-op — the trade head was never trained to
+            # mean anything there and reads as ~uniform entropy noise
+            # (~0.25). The state where the entry actually fires is the
+            # following bar: flags=0 (mid meta-period) with the chosen
+            # intent's one-hot in force — exactly what pass 2 queries (the
+            # same anchor embedding stands in for the next bar's, the
+            # closest no-look-ahead proxy). p = p(intent) · p(enter|intent).
+            obs2 = self._build_obs(emb, fused_all, idx, flags=0.0,
+                                   intent=intent)
+            with torch.no_grad():
+                view2 = self._policy_view(self.policy.mode(obs2))
+            if view2["p_enter"] is None:
                 return None, (f"policy trade appetite: the modal trade "
-                              f"action is "
-                              f"{TRADE_ACTIONS[int(view['trade'])]!r}, not "
+                              f"action under {intent_name} is "
+                              f"{TRADE_ACTIONS[int(view2['trade'])]!r}, not "
                               f"'enter' — the policy does not want a fill "
                               f"here")
-            p_enter = float(view["p_enter"])
+            p_enter = float(view2["p_enter"])
             policy_prob = p_intent * p_enter
-            size_mean = float(view["size_mean"])
-            stop_mean = float(view["stop_mean"])
-            target_mean = float(view["target_mean"])
+            # Size and levels come from pass 2 as well: they parameterize
+            # the entry order, which lives in the intent-in-force state.
+            size_mean = float(view2["size_mean"])
+            stop_mean = float(view2["stop_mean"])
+            target_mean = float(view2["target_mean"])
         else:
             # Documented fallback (module docstring): fade the trailing move.
             trailing_chg = close_px - float(close_all[w0])
@@ -451,17 +481,25 @@ class SignalEngine:
         }
 
     def _build_obs(self, emb: dict, fused_all: np.ndarray, idx: int,
+                   flags: float = 1.0, intent: Optional[int] = None,
                    ) -> dict[str, Tensor]:
         """Observation dict exactly per ``decision.interfaces.OBS_KEYS``.
 
-        The book is FLAT (zero position, all-cash portfolio), ``flags`` is
-        1.0 so the policy treats this as a meta-decision bar, and ``meta``
-        is the stand_aside one-hot: we ask the meta head to decide from a
-        neutral stance rather than nudging it with a prior intent.
+        The book is always FLAT (zero position, all-cash portfolio). Two
+        shapes serve the two-pass policy query (see ``_evaluate`` step 2):
+
+        * pass 1 (defaults): ``flags=1`` and the stand_aside one-hot — a
+          meta-decision bar queried from a neutral stance, so the meta
+          head owns the directional call without a nudging prior;
+        * pass 2: ``flags=0`` with the chosen intent's one-hot in ``meta``
+          — the state in which the env would actually accept an 'enter'
+          (an intent chosen on a meta bar takes force from the next bar).
         """
         minute = float(emb["session_minute"][idx]) if "session_minute" in emb else 195.0
         meta = np.zeros(len(META_ACTIONS), dtype=np.float32)
-        meta[META_ACTIONS.index("stand_aside")] = 1.0
+        meta_idx = (META_ACTIONS.index("stand_aside") if intent is None
+                    else int(intent))
+        meta[meta_idx] = 1.0
         obs_np: dict[str, np.ndarray] = {
             "market": fused_all[idx].astype(np.float32),
             "unc": np.array([emb["aleatoric"][idx], emb["epistemic"][idx],
@@ -471,7 +509,7 @@ class SignalEngine:
             "clock": np.array([minute / 390.0, (390.0 - minute) / 390.0],
                               dtype=np.float32),
             "meta": meta,
-            "flags": np.ones(1, dtype=np.float32),              # meta head decides
+            "flags": np.full(1, float(flags), dtype=np.float32),
         }
         return {k: torch.as_tensor(v).unsqueeze(0) for k, v in obs_np.items()}
 

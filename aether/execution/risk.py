@@ -126,6 +126,14 @@ class RiskManager:
             f"used ({signal.ticker} {'already held' if not needs_slot else 'takes a free slot'})")
 
         # --- 3. Per-instrument cap. -----------------------------------------
+        # KNOWN LIMITATION (acknowledged, unmodeled): same-ticker NETTING.
+        # qty1 caps the CANDIDATE's notional in isolation — it does not net
+        # against (or stack onto) an existing position in the same ticker,
+        # and an opposite-side signal is sized as a fresh position rather
+        # than a reduce/flip. The execution layers currently enforce one
+        # position per ticker (backtest/paper skip signals while
+        # positioned), so this path is not exercised today; if pyramiding
+        # or flips ever land, this rail must learn |existing + candidate|.
         entry_px = float(signal.entry_px)
         if not math.isfinite(entry_px) or entry_px <= 0:
             reasons.append(
