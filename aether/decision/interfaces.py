@@ -84,7 +84,8 @@ class EnvStep:
 #:   "portfolio" [3]              cash frac, day pnl rel, drawdown rel
 #:   "clock"     [2]              session progress, bars to close (both /390)
 #:   "meta"      [len(META_ACTIONS)] one-hot of current intent
-OBS_KEYS = ("market", "unc", "position", "portfolio", "clock", "meta")
+#:   "flags"     [1]              1.0 on meta-decision bars (bar % meta_every == 0)
+OBS_KEYS = ("market", "unc", "position", "portfolio", "clock", "meta", "flags")
 
 
 #: Action dict (per env):
