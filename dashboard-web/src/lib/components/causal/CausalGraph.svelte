@@ -308,7 +308,8 @@
 		};
 	}
 
-	function handleWheel(ev: WheelEvent): void {
+	function handleWheel(ev: Event): void {
+		if (!(ev instanceof WheelEvent)) return;
 		ev.preventDefault();
 		const factor = ev.deltaY > 0 ? 1.15 : 1 / 1.15;
 		const w = clampNum(vb.w * factor, W / 10, W * 1.6);

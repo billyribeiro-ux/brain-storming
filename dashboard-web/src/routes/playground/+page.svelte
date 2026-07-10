@@ -22,7 +22,6 @@
 	const N_OPTIONS = [8, 16, 32] as const;
 	const HORIZON_OPTIONS = [15, 30, 60] as const;
 
-	let date = $state('');
 	let minute = $state(180); // minutes after the 09:30 open, 0..389
 	let n = $state(8);
 	let horizon = $state(15);
@@ -32,9 +31,15 @@
 		queryFn: () => api.dates(app.ticker),
 		staleTime: Infinity
 	}));
-	$effect(() => {
+
+	// Date defaults to the newest recorded session for the current ticker; a
+	// user pick overrides it until it isn't valid for that ticker anymore.
+	let dateOverride = $state<string | null>(null);
+	const date = $derived.by(() => {
 		const dates = datesQ.data;
-		if (dates && dates.length > 0 && !dates.includes(date)) date = dates[dates.length - 1];
+		if (!dates || dates.length === 0) return '';
+		if (dateOverride !== null && dates.includes(dateOverride)) return dateOverride;
+		return dates[dates.length - 1];
 	});
 
 	/** date @ 09:30 + minute, as a naive-ET epoch (the lake's convention). */
@@ -112,7 +117,8 @@
 						<input
 							type="date"
 							class={`num ${selectClass}`}
-							bind:value={date}
+							value={date}
+							onchange={(e) => (dateOverride = e.currentTarget.value)}
 							min={datesQ.data?.[0]}
 							max={datesQ.data?.at(-1)}
 							disabled={datesQ.isPending}

@@ -18,7 +18,6 @@
 	const plotH = H - PAD.top - PAD.bottom;
 
 	let hoverIdx = $state<number | null>(null);
-	let svgEl: SVGSVGElement | null = $state(null);
 
 	const len = $derived(Math.max(fan.quantiles.p50.length, 2));
 
@@ -70,9 +69,8 @@
 		return ticks;
 	});
 
-	function idxFromClientX(clientX: number): number {
-		if (!svgEl) return 0;
-		const rect = svgEl.getBoundingClientRect();
+	function idxFromClientX(clientX: number, svg: SVGSVGElement): number {
+		const rect = svg.getBoundingClientRect();
 		const px = ((clientX - rect.left) / rect.width) * W;
 		const i = Math.round(((px - PAD.left) / plotW) * (len - 1));
 		return Math.min(len - 1, Math.max(0, i));
@@ -93,15 +91,22 @@
 </script>
 
 <div class="flex flex-col gap-1.5">
+	<!-- The chart doubles as its own value cursor: exposing it as a slider
+	     (arrow keys move the inspected bar) is the closest ARIA idiom. -->
 	<svg
-		bind:this={svgEl}
 		viewBox={`0 0 ${W} ${H}`}
 		class="block w-full rounded focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent"
-		role="application"
+		role="slider"
 		aria-roledescription="fan chart"
 		aria-label={`Imagination fan for ${fan.ticker}: ${fan.paths.length} rollouts over ${fan.horizon} bars of latent divergence — a proxy, not a price forecast. Use arrow keys to inspect values.`}
+		aria-valuemin={0}
+		aria-valuemax={len - 1}
+		aria-valuenow={hoverIdx ?? 0}
+		aria-valuetext={hoverIdx === null
+			? 'no bar inspected'
+			: `bar ${hoverIdx}: p10 ${fmtVal(at(fan.quantiles.p10, hoverIdx))}, p50 ${fmtVal(at(fan.quantiles.p50, hoverIdx))}, p90 ${fmtVal(at(fan.quantiles.p90, hoverIdx))}`}
 		tabindex="0"
-		onpointermove={(e) => (hoverIdx = idxFromClientX(e.clientX))}
+		onpointermove={(e) => (hoverIdx = idxFromClientX(e.clientX, e.currentTarget))}
 		onpointerleave={() => (hoverIdx = null)}
 		onkeydown={onKeydown}
 	>

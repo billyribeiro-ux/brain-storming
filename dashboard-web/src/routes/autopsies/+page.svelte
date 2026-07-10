@@ -17,12 +17,13 @@
 	import { DownloadSimple } from 'phosphor-svelte';
 
 	// ------------------------------------------------------------------ //
-	// Filters
+	// Filters — defaults are *derived* (newest backtest, its own date span)
+	// and user picks are overrides, so no effect ever writes filter state.
 	// ------------------------------------------------------------------ //
-	let backtest = $state('');
+	let backtestOverride = $state<string | null>(null);
+	let fromOverride = $state<string | null>(null);
+	let toOverride = $state<string | null>(null);
 	let ticker = $state(''); // '' = all tickers
-	let from = $state('');
-	let to = $state('');
 	let verdict = $state(''); // '' = all verdicts
 	let inspected = $state<Trade | null>(null);
 
@@ -32,26 +33,18 @@
 	}));
 	const tickersQ = createQuery(() => ({ queryKey: ['tickers'], queryFn: () => api.tickers() }));
 
-	// Default to the newest backtest once the list arrives.
-	$effect(() => {
-		const list = backtestsQ.data;
-		if (list && list.length > 0 && backtest === '') backtest = list[0].name;
-	});
-
+	const backtest = $derived(backtestOverride ?? backtestsQ.data?.[0]?.name ?? '');
 	const selectedBt = $derived(backtestsQ.data?.find((b) => b.name === backtest) ?? null);
+	const from = $derived(fromOverride ?? selectedBt?.start ?? '');
+	const to = $derived(toOverride ?? selectedBt?.end ?? '');
 
-	// Date range defaults to the selected backtest's own span (re-applied on
-	// backtest change so the log always opens on a meaningful window). The
-	// guard keeps background refetches from clobbering a hand-edited range.
-	let appliedBacktest = '';
-	$effect(() => {
-		if (selectedBt && selectedBt.name !== appliedBacktest) {
-			appliedBacktest = selectedBt.name;
-			from = selectedBt.start ?? '';
-			to = selectedBt.end ?? '';
-			inspected = null;
-		}
-	});
+	/** Switching backtests resets the date range and the inspected trade. */
+	function selectBacktest(name: string): void {
+		backtestOverride = name;
+		fromOverride = null;
+		toOverride = null;
+		inspected = null;
+	}
 
 	const tradesQ = createQuery(() => ({
 		queryKey: ['trades', backtest, ticker, from, to],
@@ -172,7 +165,12 @@
 	<div class="glass flex flex-wrap items-end gap-3 px-3 py-2">
 		<label class="flex flex-col gap-0.5 text-[10px] tracking-wide text-ink-faint uppercase">
 			Backtest
-			<select class={selectClass} bind:value={backtest} disabled={backtestsQ.isPending}>
+			<select
+				class={selectClass}
+				value={backtest}
+				onchange={(e) => selectBacktest(e.currentTarget.value)}
+				disabled={backtestsQ.isPending}
+			>
 				{#if backtestsQ.isPending}
 					<option value="">loading…</option>
 				{:else}
@@ -193,11 +191,23 @@
 		</label>
 		<label class="flex flex-col gap-0.5 text-[10px] tracking-wide text-ink-faint uppercase">
 			From
-			<input type="date" class={`num ${selectClass}`} bind:value={from} max={to || undefined} />
+			<input
+				type="date"
+				class={`num ${selectClass}`}
+				value={from}
+				onchange={(e) => (fromOverride = e.currentTarget.value)}
+				max={to || undefined}
+			/>
 		</label>
 		<label class="flex flex-col gap-0.5 text-[10px] tracking-wide text-ink-faint uppercase">
 			To
-			<input type="date" class={`num ${selectClass}`} bind:value={to} min={from || undefined} />
+			<input
+				type="date"
+				class={`num ${selectClass}`}
+				value={to}
+				onchange={(e) => (toOverride = e.currentTarget.value)}
+				min={from || undefined}
+			/>
 		</label>
 		<label class="flex flex-col gap-0.5 text-[10px] tracking-wide text-ink-faint uppercase">
 			Verdict
