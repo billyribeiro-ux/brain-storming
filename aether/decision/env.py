@@ -630,24 +630,43 @@ class TradingEnv:
               ) -> dict[str, np.ndarray]:
         """Start ``n_envs`` fresh episodes; returns the initial obs dict.
 
-        ``episode_ids`` (indices into :attr:`episodes`) pins the episodes
-        deterministically (length must equal ``n_envs``); ``None`` samples
-        with the env's seeded RNG — without replacement whenever enough
-        distinct episodes exist.
+        ``episode_ids`` restricts which episodes may run. Entries are either
+        integer indices into :attr:`episodes` or ``(ticker, "YYYY-MM-DD")``
+        tuples (the curriculum sampler's currency — resolved here so callers
+        never depend on index order). Exactly ``n_envs`` entries pin
+        episodes deterministically; a LARGER pool is sampled from with the
+        env's seeded RNG — this is how a curriculum stage exposes its whole
+        eligible set. ``None`` samples from all episodes.
         """
         m = len(self._episodes)
         if episode_ids is None:
             ids = self._rng.choice(m, size=self.n_envs,
                                    replace=self.n_envs > m)
         else:
-            ids = np.asarray(list(episode_ids), dtype=np.int64)
-            if ids.shape != (self.n_envs,):
-                raise ValueError(
-                    f"reset: episode_ids must have length n_envs="
-                    f"{self.n_envs}, got shape {ids.shape}")
-            if ids.size and (int(ids.min()) < 0 or int(ids.max()) >= m):
+            index = getattr(self, "_episode_index", None)
+            if index is None:
+                index = {(e.ticker, str(e.date)): i
+                         for i, e in enumerate(self._episodes)}
+                self._episode_index = index
+            pool: list[int] = []
+            for e in episode_ids:
+                if isinstance(e, (tuple, list)) and len(e) == 2:
+                    key = (str(e[0]), str(e[1]))
+                    if key not in index:
+                        raise ValueError(f"reset: unknown episode {key!r}")
+                    pool.append(index[key])
+                else:
+                    pool.append(int(e))
+            ids = np.asarray(pool, dtype=np.int64)
+            if ids.size == 0:
+                raise ValueError("reset: episode_ids is empty")
+            if int(ids.min()) < 0 or int(ids.max()) >= m:
                 raise ValueError(
                     f"reset: episode ids must lie in [0, {m}), got {ids}")
+            if ids.shape != (self.n_envs,):
+                # A pool, not a pinning: sample n_envs episodes from it.
+                ids = self._rng.choice(ids, size=self.n_envs,
+                                       replace=self.n_envs > ids.size)
         for i, e in enumerate(ids):
             self._reset_one(i, int(e))
         self._was_reset = True
