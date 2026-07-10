@@ -273,8 +273,13 @@ def equity(backtest: str = "") -> list[dict]:
         return []
     df = pd.read_parquet(path)
     tcol = "ts" if "ts" in df.columns else df.columns[0]
+    # Numeric ts columns hold naive-ET epoch SECONDS (the lake convention);
+    # pd.to_datetime would otherwise read integers as nanoseconds -> 1970.
+    col = df[tcol]
+    times = (pd.to_datetime(col, unit="s") if pd.api.types.is_numeric_dtype(col)
+             else pd.to_datetime(col))
     return [{"t": t, "equity": float(e)} for t, e in
-            zip(_ts(pd.to_datetime(df[tcol])), df["equity"])]
+            zip(_ts(times), df["equity"])]
 
 
 @app.get("/api/autopsies")

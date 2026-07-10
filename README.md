@@ -177,6 +177,36 @@ python3 -m pytest tests/ -q       # the invariant suite
 | Options flow & surfaces | blocked on data plan (auto-enables via probe) |
 | GPU-scale training, meta-controller depth, live NAS loops | next iterations |
 
+## The Cockpit (`dashboard-web/`) — institutional web UI
+
+A SvelteKit cockpit (Svelte 5 runes, TypeScript strict, Tailwind v4,
+Lightweight Charts, TanStack Query, Zod, phosphor icons, Node 24 LTS, pnpm)
+fed by a FastAPI bridge (`aether/dashboard/api.py`) over HTTP + WebSocket.
+
+```bash
+# 1. the Python bridge (REST + WS on :8600)
+python3 scripts/run_api.py
+
+# 2. the cockpit (dev on :5173, or build+preview on :4173)
+cd dashboard-web && pnpm install
+pnpm dev            # development
+pnpm build && pnpm preview   # production build behind the same proxy
+```
+
+Pages: **Deck** (candles with signal arrows, stop/target lines, brain-
+attention strip, live signal feed, driver compass), **Autopsies** (period-
+filterable trade log with CSV export, autopsy detail, equity + drawdown),
+**Playground** (session replay streaming real recorded bars + the signals
+the backtest actually emitted; imagination fan honestly labeled as latent
+divergence), **Brain** (status grid, training sparklines, interactive
+42-node causal graph). Real-time via native WebSocket (`/ws`): replayed
+bars, signals, trades, heartbeats. Feedback posts land in
+`data/feedback.jsonl` and flow to the lessons buffer. The e2e walkthrough
+lives at `dashboard-web/e2e/walkthrough.mjs` (Playwright).
+
+The legacy Streamlit dashboard (`aether/dashboard/app.py`) remains for
+quick local inspection; the cockpit is the primary interface.
+
 ## Honesty notes
 
 * Options-flow decoding is registered but **not active** — the current FMP

@@ -106,12 +106,13 @@
 		<Panel title="Imagination" subtitle="roll the world model forward from any anchor minute">
 			<div class="flex flex-col gap-3">
 				<div class="flex flex-wrap items-end gap-3">
-					<label class="flex flex-col gap-0.5 text-[10px] tracking-wide text-ink-faint uppercase">
+					<!-- read-only: the anchor ticker follows the global app selection -->
+					<div class="flex flex-col gap-0.5 text-[10px] tracking-wide text-ink-faint uppercase">
 						Ticker
 						<span class="num rounded-md border border-hairline bg-raised px-2 py-1 text-xs text-ink"
 							>{app.ticker}</span
 						>
-					</label>
+					</div>
 					<label class="flex flex-col gap-0.5 text-[10px] tracking-wide text-ink-faint uppercase">
 						Date
 						<input

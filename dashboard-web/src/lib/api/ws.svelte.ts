@@ -20,12 +20,13 @@ class LiveFeed {
 	trades = $state<Trade[]>([]);
 	/** Latest replayed/live bar per ticker (the chart appends from here). */
 	lastBar = $state<Record<string, Bar>>({});
-	replay = $state<{ running: boolean; ticker: string | null; date: string | null; speed: number }>({
-		running: false,
-		ticker: null,
-		date: null,
-		speed: 1
-	});
+	replay = $state<{
+		running: boolean;
+		ticker: string | null;
+		date: string | null;
+		cursor: number | null;
+		speed: number;
+	}>({ running: false, ticker: null, date: null, cursor: null, speed: 1 });
 	badFrames = $state(0);
 
 	#ws: WebSocket | null = null;
@@ -77,6 +78,7 @@ class LiveFeed {
 						running: ev.payload.running,
 						ticker: ev.payload.ticker,
 						date: ev.payload.date,
+						cursor: ev.payload.cursor,
 						speed: ev.payload.speed
 					};
 					break;
