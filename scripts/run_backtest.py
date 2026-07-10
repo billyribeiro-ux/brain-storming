@@ -379,7 +379,10 @@ def main(argv: list[str] | None = None) -> int:
     cfg = AetherConfig.from_env()  # loads .env implicitly
     if args.data_root:
         cfg.data.root = Path(args.data_root)
-    tickers = tuple(args.tickers) if args.tickers else tuple(TICKER_IDS)
+    # Accept both space-separated and comma-joined ticker lists (siblings
+    # like train_rl.py use commas; muscle memory should not fail a run).
+    tickers = tuple(t for arg in (args.tickers or [])
+                    for t in arg.split(",") if t) or tuple(TICKER_IDS)
     name = args.name or f"{args.mode}-{time.strftime('%Y%m%d-%H%M%S')}"
 
     bt_cfg = BacktestConfig(
