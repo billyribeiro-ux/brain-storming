@@ -1,0 +1,25 @@
+# Secrets — the FMP API key lives in .env and must NEVER be committed.
+.env
+
+# Data lake, caches, and artifacts (root-anchored — aether/data is source code!)
+/data/
+/checkpoints/
+/runs/
+*.parquet
+*.npy
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
