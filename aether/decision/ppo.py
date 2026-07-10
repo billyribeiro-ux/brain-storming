@@ -400,9 +400,9 @@ class PPOTrainer:
                         ((ratio - 1.0).abs() > cfg.clip).float().mean())
                 epoch_kls.append(approx_kl)
 
-                totals["policy_loss"] += float(policy_loss)
-                totals["value_loss"] += float(value_loss)
-                totals["entropy"] += float(entropy_mean)
+                totals["policy_loss"] += float(policy_loss.detach())
+                totals["value_loss"] += float(value_loss.detach())
+                totals["entropy"] += float(entropy_mean.detach())
                 totals["approx_kl"] += approx_kl
                 totals["clip_frac"] += clip_frac
                 n_minibatches += 1

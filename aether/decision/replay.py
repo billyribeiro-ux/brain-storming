@@ -190,11 +190,12 @@ class HindsightMiner:
 
         * ``lessons`` — entries ``{"kind": "missed_reversal", "ticker",
           "anchor_ts", "weight"}``; ``anchor_ts`` is the timestamp of the
-          session's *first* price extreme (the pivot the reversal turned
-          on — for a V-shaped session that is the low, for an inverted V
-          the high; bar index when the episode has no ``anchor_ts``), and
-          ``weight`` is the swing expressed in threshold multiples, so a 3%
-          swing at a 1% threshold weighs 3.0.
+          reversal pivot — the price extreme whose subsequent counter-move
+          is the larger one (the low of a V session, the high of an
+          inverted V; for one-way drift, the session's starting extreme).
+          Falls back to the bar index when the episode carries no
+          ``anchor_ts``. ``weight`` is the swing in threshold multiples,
+          so a 3% swing at a 1% threshold weighs 3.0.
         * ``hard_ids`` — buffer ids for value-refit oversampling.
 
         With ``update_weights`` (default) each hit's buffer sampling weight
@@ -216,9 +217,19 @@ class HindsightMiner:
             if swing <= self.swing_threshold:
                 continue
 
-            # The reversal pivot is the first extreme reached: everything
-            # after it is the move the agent failed to capture.
-            pivot = int(min(np.argmin(closes), np.argmax(closes)))
+            # The reversal pivot is the extreme that anchors the larger
+            # recoverable swing — the turn the agent failed to trade.
+            # (min/argmin alone would mis-anchor sessions that open at an
+            # extreme: a V opening at its high has argmax = bar 0.)
+            i_min, i_max = int(np.argmin(closes)), int(np.argmax(closes))
+            up_after_min = float(closes[i_min:].max() - closes[i_min])
+            down_after_max = float(closes[i_max] - closes[i_max:].min())
+            if up_after_min > down_after_max:
+                pivot = i_min                    # long reversal off the low
+            elif down_after_max > up_after_min:
+                pivot = i_max                    # short reversal off the high
+            else:
+                pivot = max(i_min, i_max)        # symmetric: the later turn
             anchor = episode.get("anchor_ts")
             anchor_ts = (int(_to_numpy(anchor)[pivot])
                          if anchor is not None else pivot)
