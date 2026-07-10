@@ -893,7 +893,9 @@ def _greedy_actions(policy, obs: dict, carry):
             out = policy.act(obs_t, carry)
 
     if isinstance(out, dict):
-        actions, new_carry = out, carry
+        # HierarchicalPolicy.mode returns a flat dict whose action keys sit
+        # at the top level alongside distribution stats and the new carry.
+        actions, new_carry = out, out.get("carry", carry)
     else:
         actions, new_carry = out[0], out[-1]
     acts: dict[str, np.ndarray] = {}

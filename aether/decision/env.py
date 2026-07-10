@@ -72,6 +72,19 @@ Within one ``step`` call at pointer ``t``, per env, in this exact order:
    done. The terminal reward additionally receives the hindsight
    reversal-capture bonus (see :mod:`aether.decision.reward`).
 
+Auto-reset (documented contract decision)
+-----------------------------------------
+The interface contract is silent on what happens after an episode ends, so
+this env commits to SAME-STEP auto-reset — the semantics the PPO trainer
+and its reference MiniEnv assume: the step that finishes an episode returns
+``done=True`` (exactly once, with the terminal reward including the
+hindsight bonus) and the *observation of a freshly sampled episode's first
+bar*. The next action therefore applies to the new episode, the trainer
+zeroes the recurrent carry at the boundary, and GAE masks the bootstrap
+with ``1 − done``. No env is ever inert: consumers that replay a fixed
+episode set (backtests) must stop reading an env's stream once it has
+reported done.
+
 Every closed round-trip is emitted as a
 :class:`~aether.worldmodel.interfaces.TradeRecord` under
 ``info[i]['trade_closed']``. Equity is marked to market on the anchor close
@@ -133,7 +146,11 @@ NPZ_KEYS: tuple[str, ...] = (
 RANGE_WINDOW_BARS: int = 15
 
 #: Minimum bars for a (ticker, session) group to count as an episode.
-MIN_EPISODE_BARS: int = 200
+#: The floor exists to reject degenerate data holes (a handful of stray
+#: anchors), NOT to exclude short-but-real sessions: NYSE half days after
+#: perception-window trimming can yield <100 anchors and remain perfectly
+#: tradable, and the stack's synthetic fixtures replay 120-bar sessions.
+MIN_EPISODE_BARS: int = 30
 
 #: Realized-range fallback for the degenerate first bar of an episode
 #: (no completed bar range is observable yet): a conservative 10 bps of
@@ -474,8 +491,8 @@ class TradingEnv:
         reward weights independently of market/execution parameters.
     min_episode_bars:
         Sessions with fewer usable bars than this are not indexed as
-        episodes (default 200 — a real session has ~390; much shorter means
-        a half day or a data hole). Tests may lower it.
+        episodes (default 30 — enough to reject degenerate data holes
+        while keeping half days and truncated test sessions replayable).
 
     Observation semantics (contract keys, exact shapes; all float32):
 
@@ -491,7 +508,9 @@ class TradingEnv:
     * ``meta [3]``     one-hot of the intent currently in force.
     * ``flags [1]``    1.0 on meta-decision bars (t % meta_every == 0).
 
-    A done env stays done (zero reward, frozen obs) until ``reset``.
+    A finished sub-env AUTO-RESETS within the same step call: ``done=True``
+    is reported exactly once at the boundary, and the returned obs already
+    belongs to a freshly sampled episode (module docstring, "Auto-reset").
     """
 
     def __init__(self, cfg: EnvConfig, n_envs: int,
@@ -534,7 +553,6 @@ class TradingEnv:
         self._peak = np.full(n, self._eq0, dtype=np.float64)
         self._meta = np.full(n, _META_STAND_ASIDE, dtype=np.int64)
         self._trades: list[list[TradeRecord]] = [[] for _ in range(n)]
-        self._done = np.ones(n, dtype=bool)  # unusable until reset()
         self._was_reset = False
 
         logger.info("TradingEnv: %d episodes across %d tickers, D=%d, "
@@ -631,25 +649,28 @@ class TradingEnv:
                 raise ValueError(
                     f"reset: episode ids must lie in [0, {m}), got {ids}")
         for i, e in enumerate(ids):
-            self._ep[i] = self._episodes[int(e)]
-        self._t[:] = 0
-        self._cash[:] = self._eq0
-        self._qty[:] = 0.0
-        self._entry_px[:] = 0.0
-        self._stop_px[:] = 0.0
-        self._target_px[:] = 0.0
-        self._entry_fee[:] = 0.0
-        self._entry_ts[:] = 0
-        self._entry_bar[:] = 0
-        self._entry_intent[:] = _META_STAND_ASIDE
-        self._entry_size[:] = 0.0
-        self._bars_in_pos[:] = 0
-        self._peak[:] = self._eq0
-        self._meta[:] = _META_STAND_ASIDE
-        self._trades = [[] for _ in range(self.n_envs)]
-        self._done[:] = False
+            self._reset_one(i, int(e))
         self._was_reset = True
         return self._obs()
+
+    def _reset_one(self, i: int, episode_idx: int) -> None:
+        """Reset env ``i`` onto episode ``episode_idx`` (fresh state)."""
+        self._ep[i] = self._episodes[episode_idx]
+        self._t[i] = 0
+        self._cash[i] = self._eq0
+        self._qty[i] = 0.0
+        self._entry_px[i] = 0.0
+        self._stop_px[i] = 0.0
+        self._target_px[i] = 0.0
+        self._entry_fee[i] = 0.0
+        self._entry_ts[i] = 0
+        self._entry_bar[i] = 0
+        self._entry_intent[i] = _META_STAND_ASIDE
+        self._entry_size[i] = 0.0
+        self._bars_in_pos[i] = 0
+        self._peak[i] = self._eq0
+        self._meta[i] = _META_STAND_ASIDE
+        self._trades[i] = []
 
     # ------------------------------------------------------------------ #
     # Step
@@ -661,17 +682,24 @@ class TradingEnv:
             raise RuntimeError("TradingEnv.step called before reset()")
         acts = self._validate_actions(actions)
         rewards = np.zeros(self.n_envs, dtype=np.float32)
+        dones = np.zeros(self.n_envs, dtype=bool)
         infos: list[dict] = [{} for _ in range(self.n_envs)]
+        m = len(self._episodes)
         for i in range(self.n_envs):
-            if self._done[i]:
-                continue  # stays done, frozen obs, zero reward
-            rewards[i] = self._step_env(
+            rewards[i], done = self._step_env(
                 i, {key: acts[key][i] for key in ACTION_KEYS}, infos[i])
+            if done:
+                dones[i] = True
+                # SAME-STEP AUTO-RESET (see module docstring): the returned
+                # obs for this env is the first bar of a freshly sampled
+                # episode; done=True marks the boundary exactly once.
+                self._reset_one(i, int(self._rng.integers(m)))
         return EnvStep(obs=self._obs(), reward=rewards,
-                       done=self._done.copy(), info=infos)
+                       done=dones, info=infos)
 
-    def _step_env(self, i: int, a: dict[str, Any], info: dict) -> float:
-        """One env's transition t -> t+1. Returns the shaped reward."""
+    def _step_env(self, i: int, a: dict[str, Any],
+                  info: dict) -> tuple[float, bool]:
+        """One env's transition t -> t+1: (shaped reward, episode done)."""
         ep = self._ep[i]
         t = int(self._t[i])
         close_t = float(ep.close[t])
@@ -757,12 +785,10 @@ class TradingEnv:
         if self._qty[i] != 0.0:
             self._bars_in_pos[i] += 1
         done = t2 >= ep.length - 1
-        if done:
-            if self._qty[i] != 0.0:
-                d = 1.0 if self._qty[i] > 0.0 else -1.0
-                px = float(ep.close[t2]) * (1.0 - d * self._slip)
-                self._close_position(i, px, int(ep.ts[t2]), t2, "eod", info)
-            self._done[i] = True
+        if done and self._qty[i] != 0.0:
+            d = 1.0 if self._qty[i] > 0.0 else -1.0
+            px = float(ep.close[t2]) * (1.0 - d * self._slip)
+            self._close_position(i, px, int(ep.ts[t2]), t2, "eod", info)
 
         equity = self._cash[i] + self._qty[i] * float(ep.close[t2])
         self._peak[i] = max(self._peak[i], equity)
@@ -772,7 +798,7 @@ class TradingEnv:
         if done:
             # Hindsight capture bonus: terminal only, never in observations.
             reward += self._shaper.terminal_bonus(self._trades[i], ep.close)
-        return float(reward)
+        return float(reward), bool(done)
 
     # ------------------------------------------------------------------ #
     # Internals

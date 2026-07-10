@@ -82,7 +82,7 @@ class FisherRegularizer:
     # ------------------------------------------------------------------ #
 
     def snapshot(self, model: nn.Module, loss_fn: Callable[[], Tensor],
-                 n_batches: int) -> None:
+                 n_batches: int = 32) -> None:
         """Estimate the diagonal Fisher and anchor the current parameters.
 
         Parameters
@@ -97,7 +97,7 @@ class FisherRegularizer:
             build a fresh graph over ``model``'s parameters.
         n_batches:
             Number of batches to average ``grad²`` over. More batches →
-            lower-variance Fisher. 32–128 is a sensible range.
+            lower-variance Fisher. 32–128 is a sensible range (default 32).
 
         Notes
         -----

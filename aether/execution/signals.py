@@ -28,8 +28,10 @@ Every component is OPTIONAL. A missing component's evidence source simply
 drops out of the consensus and the remaining weights are renormalized
 (``exp(Σ w·ln v / Σ w)`` over available sources only), so a bare engine with
 just a policy degrades gracefully instead of failing. The EvidenceBundle
-records unavailable sources as ``NaN`` so the audit trail distinguishes
-"source said 0.5" from "source absent".
+records unavailable sources as the neutral no-information likelihood 0.5
+(the bundle contract pins every source to [0, 1]); the rationale names the
+missing sources explicitly, so the audit trail still distinguishes
+"source measured 0.5" from "source absent".
 
 Honesty notes (read before trusting a rationale)
 ------------------------------------------------
@@ -93,27 +95,14 @@ _RANGE_BARS: int = 15
 #: Fraction of entry price used as the range when high/low arrays are absent.
 _RANGE_FALLBACK_FRAC: float = 0.003
 
-#: Candidate npz key names for the next-bar OHLC arrays. The EmbeddingStore
-#: contract pins their EXISTENCE ("open/high/low of the NEXT bar") but not
-#: the exact spelling, so we probe the plausible names defensively.
-_NEXT_BAR_KEYS: dict[str, tuple[str, ...]] = {
-    "open": ("next_open", "open_next", "next_bar_open"),
-    "high": ("next_high", "high_next", "next_bar_high"),
-    "low": ("next_low", "low_next", "next_bar_low"),
-}
-
 #: Floor for evidence values inside the geometric mean: ln(0) would collapse
 #: conviction to -inf; 1e-6 keeps the veto behavior (conviction ~0) while
 #: staying numerically defined.
 _EVIDENCE_EPS: float = 1e-6
 
-
-def _first_present(emb: dict, names: tuple[str, ...]) -> Optional[np.ndarray]:
-    """First array present in ``emb`` under any of ``names`` (else None)."""
-    for name in names:
-        if name in emb:
-            return np.asarray(emb[name])
-    return None
+#: Neutral no-information likelihood recorded in the EvidenceBundle for
+#: sources that were absent from the consensus (contract pins [0, 1]).
+_NEUTRAL_EVIDENCE: float = 0.5
 
 
 def _to_1d(x) -> np.ndarray:
@@ -129,12 +118,13 @@ class SignalEngine:
     Parameters
     ----------
     policy:
-        Decision-core policy exposing ``mode(obs) -> dict`` with keys
+        Decision-core policy exposing ``mode(obs)``. Preferred shape: the
+        flat dict of ``HierarchicalPolicy.mode`` — greedy actions plus
         ``"meta_probs"`` [B, len(META_ACTIONS)], ``"trade_probs"``
         [B, len(TRADE_ACTIONS)] (softmax probabilities) and ``"size_mean"``,
-        ``"stop_mean"``, ``"target_mean"`` [B] (Beta-distribution means in
-        (0, 1]). ``mode`` is the deterministic counterpart of
-        ``PolicyProtocol.act`` — head distributions without sampling.
+        ``"stop_mean"``, ``"target_mean"`` [B] (Beta means in (0, 1]).
+        ``act``-style tuples ``(actions, logprobs, value, carry)`` from
+        duck-typed policies are also accepted (see :meth:`_policy_view`).
     dynamics:
         ``worldmodel.interfaces.LatentDynamics`` implementation
         (``observe`` / ``imagine``).
@@ -257,24 +247,25 @@ class SignalEngine:
         if self.policy is not None:
             obs = self._build_obs(emb, fused_all, idx)
             with torch.no_grad():
-                mode_out = self.policy.mode(obs)
-            meta_probs = _to_1d(mode_out["meta_probs"])
-            trade_probs = _to_1d(mode_out["trade_probs"])
-            choice = int(np.argmax(meta_probs))
-            intent_name = META_ACTIONS[choice]
+                view = self._policy_view(self.policy.mode(obs))
+            intent = int(view["intent"])
+            intent_name = META_ACTIONS[intent]
+            p_intent = float(view["p_intent"])
             if intent_name == "stand_aside":
-                return None, (f"policy intent: stand_aside is the modal intent "
-                              f"(p={meta_probs[choice]:.3f} vs hunt_long "
-                              f"{meta_probs[META_ACTIONS.index('hunt_long')]:.3f}, "
-                              f"hunt_short "
-                              f"{meta_probs[META_ACTIONS.index('hunt_short')]:.3f})")
+                return None, (f"policy intent: stand_aside is the modal "
+                              f"intent (p={p_intent:.3f})")
             side = "long" if intent_name == "hunt_long" else "short"
-            p_intent = float(meta_probs[choice])
-            p_enter = float(trade_probs[TRADE_ACTIONS.index("enter")])
+            if view["p_enter"] is None:
+                return None, (f"policy trade appetite: the modal trade "
+                              f"action is "
+                              f"{TRADE_ACTIONS[int(view['trade'])]!r}, not "
+                              f"'enter' — the policy does not want a fill "
+                              f"here")
+            p_enter = float(view["p_enter"])
             policy_prob = p_intent * p_enter
-            size_mean = float(_to_1d(mode_out["size_mean"])[0])
-            stop_mean = float(_to_1d(mode_out["stop_mean"])[0])
-            target_mean = float(_to_1d(mode_out["target_mean"])[0])
+            size_mean = float(view["size_mean"])
+            stop_mean = float(view["stop_mean"])
+            target_mean = float(view["target_mean"])
         else:
             # Documented fallback (module docstring): fade the trailing move.
             trailing_chg = close_px - float(close_all[w0])
@@ -329,10 +320,15 @@ class SignalEngine:
         saliency = self._saliency(batch)
         causal_drivers = self._causal_drivers(ticker)
 
+        # Absent sources are recorded as the neutral 0.5 likelihood (the
+        # bundle contract pins [0, 1]); the rationale names them missing.
         evidence = EvidenceBundle(
-            policy_prob=float(policy_prob) if policy_prob is not None else float("nan"),
-            imagination_agreement=float(imagination) if imagination is not None else float("nan"),
-            analog_winrate=float(analog_winrate) if analog_winrate is not None else float("nan"),
+            policy_prob=(float(policy_prob) if policy_prob is not None
+                         else _NEUTRAL_EVIDENCE),
+            imagination_agreement=(float(imagination) if imagination is not None
+                                   else _NEUTRAL_EVIDENCE),
+            analog_winrate=(float(analog_winrate) if analog_winrate is not None
+                            else _NEUTRAL_EVIDENCE),
             aleatoric=aleatoric,
             epistemic=epistemic,
             anomaly=anomaly,
@@ -375,6 +371,79 @@ class SignalEngine:
     # ------------------------------------------------------------------ #
     # Evidence gathering
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _policy_view(mode_out) -> dict:
+        """Normalize a policy's ``mode`` output to one evidence view.
+
+        Accepted shapes (documented reconciliation across builders):
+
+        * the rich FLAT dict of ``HierarchicalPolicy.mode`` — greedy
+          actions plus ``meta_probs`` / ``trade_probs`` /
+          ``size_mean`` / ``stop_mean`` / ``target_mean``. The intent is
+          the meta argmax and ``p_enter`` is read off ``trade_probs``
+          regardless of the modal trade action;
+        * an ``act``-style tuple ``(actions, logprobs, value, carry)``
+          from duck-typed policies. Only the modal action and its own
+          probability are knowable here, so ``p_enter`` is ``None``
+          (unknown) unless the modal trade action IS ``enter`` — the
+          caller abstains on ``None`` (conservative: no invented
+          probabilities).
+
+        Returns ``{"intent", "p_intent", "trade", "p_enter", "size_mean",
+        "stop_mean", "target_mean"}`` with row 0 of each batch.
+        """
+        enter_idx = TRADE_ACTIONS.index("enter")
+        if isinstance(mode_out, dict):
+            actions = mode_out
+            meta_probs = (_to_1d(mode_out["meta_probs"])
+                          if "meta_probs" in mode_out else None)
+            trade_probs = (_to_1d(mode_out["trade_probs"])
+                           if "trade_probs" in mode_out else None)
+            intent = (int(np.argmax(meta_probs)) if meta_probs is not None
+                      else int(_to_1d(actions["meta"])[0]))
+            trade = (int(np.argmax(trade_probs)) if trade_probs is not None
+                     else int(_to_1d(actions["trade"])[0]))
+            # A probability-less dict gets the neutral 0.5 likelihood —
+            # a deterministic action report carries no confidence and must
+            # not masquerade as certainty.
+            p_intent = (float(meta_probs[intent]) if meta_probs is not None
+                        else _NEUTRAL_EVIDENCE)
+            p_enter = (float(trade_probs[enter_idx])
+                       if trade_probs is not None else _NEUTRAL_EVIDENCE)
+        else:
+            seq = list(mode_out)
+            dicts = [x for x in seq if isinstance(x, dict) and "trade" in x]
+            if not dicts:
+                raise TypeError(
+                    f"policy.mode returned {type(mode_out).__name__} without "
+                    "an actions dict — cannot extract policy evidence")
+            actions = dicts[0]
+            logprobs = dicts[1] if len(dicts) > 1 else None
+            intent = int(_to_1d(actions["meta"])[0])
+            trade = int(_to_1d(actions["trade"])[0])
+
+            def _prob(key: str) -> float:
+                if logprobs is None or key not in logprobs:
+                    return _NEUTRAL_EVIDENCE
+                return float(np.clip(np.exp(_to_1d(logprobs[key])[0]),
+                                     0.0, 1.0))
+
+            p_intent = _prob("meta")
+            p_enter = _prob("trade") if trade == enter_idx else None
+
+        def _mean(key: str) -> float:
+            for name in (f"{key}_mean", key):
+                if name in actions:
+                    return float(_to_1d(actions[name])[0])
+            return _NEUTRAL_EVIDENCE  # neutral Beta mean
+
+        return {
+            "intent": intent, "p_intent": p_intent,
+            "trade": trade, "p_enter": p_enter,
+            "size_mean": _mean("size"), "stop_mean": _mean("stop"),
+            "target_mean": _mean("target"),
+        }
 
     def _build_obs(self, emb: dict, fused_all: np.ndarray, idx: int,
                    ) -> dict[str, Tensor]:
@@ -469,14 +538,15 @@ class SignalEngine:
                       ) -> tuple[float, bool]:
         """Mean high-low range of the trailing ``_RANGE_BARS`` bars.
 
-        The store carries NEXT-bar OHL, so bar ``t``'s high/low live at
+        The store carries NEXT-bar OHL under the canonical EmbeddingStore
+        keys (``next_high`` / ``next_low``), so bar ``t``'s high/low live at
         index ``t - 1``: the trailing window ending at the anchor is the
         slice ``[idx - _RANGE_BARS, idx)``. Returns ``(range, used_fallback)``
         — the fallback is ``_RANGE_FALLBACK_FRAC`` of the entry price when
         the arrays are missing or degenerate.
         """
-        highs = _first_present(emb, _NEXT_BAR_KEYS["high"])
-        lows = _first_present(emb, _NEXT_BAR_KEYS["low"])
+        highs = np.asarray(emb["next_high"]) if "next_high" in emb else None
+        lows = np.asarray(emb["next_low"]) if "next_low" in emb else None
         if highs is not None and lows is not None:
             lo_i = max(0, idx - _RANGE_BARS)
             spans = (np.asarray(highs[lo_i:idx], dtype=np.float64)

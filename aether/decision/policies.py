@@ -64,6 +64,7 @@ are reproducible under ``torch.manual_seed``. ``mode`` is sampling-free
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -276,22 +277,69 @@ class HierarchicalPolicy(nn.Module):
 
     @torch.no_grad()
     def mode(
-        self, obs: dict[str, Tensor], carry: Tensor
-    ) -> tuple[dict[str, Tensor], Tensor]:
-        """Greedy (deterministic) actions for eval/backtests.
+        self, obs: dict[str, Tensor], carry: Optional[Tensor] = None
+    ) -> dict[str, Tensor]:
+        """Greedy (deterministic) actions + head distributions, sampling-free.
 
         Discrete heads: argmax of logits (meta still masked by flags).
         Continuous heads: Beta mean α/(α+β), rescaled to (ε, 1].
-        Returns ``(actions, new_carry)``.
+
+        Returns one FLAT dict of tensors (a documented cross-layer
+        reconciliation: the backtester consumes the greedy actions, the
+        signal engine consumes the distributions, and the test suite
+        iterates every value as a tensor — so everything lives at the top
+        level rather than in nested sub-dicts):
+
+        * ``meta`` / ``trade`` — greedy discrete actions ``[B]`` (int64),
+        * ``size`` / ``stop`` / ``target`` — Beta means rescaled ``[B]``,
+        * ``meta_probs [B, len(META_ACTIONS)]`` / ``trade_probs
+          [B, len(TRADE_ACTIONS)]`` — full softmax probabilities,
+        * ``size_mean`` / ``stop_mean`` / ``target_mean`` ``[B]`` — aliases
+          of the greedy continuous actions (the Beta means),
+        * ``value [B]`` — critic estimate,
+        * ``carry [B, memory_dim]`` — the new recurrent state.
+
+        ``carry=None`` starts from :meth:`initial_carry` (stateless probes,
+        e.g. one-shot signal generation on a flat book).
         """
         obs = self._prep(obs)
+        if carry is None:
+            carry = self.initial_carry(obs["market"].shape[0],
+                                       obs["market"].device)
         feature = self._features(obs, carry)
         mask, prev = self._meta_context(obs)
 
-        meta = torch.where(mask, self.meta_head(feature).argmax(dim=-1), prev)
-        trade = self.trade_head(feature).argmax(dim=-1)
-        actions: dict[str, Tensor] = {"meta": meta, "trade": trade}
+        meta_probs = torch.softmax(self.meta_head(feature), dim=-1)
+        trade_probs = torch.softmax(self.trade_head(feature), dim=-1)
+        meta = torch.where(mask, meta_probs.argmax(dim=-1), prev)
+        out: dict[str, Tensor] = {
+            "meta": meta,
+            "trade": trade_probs.argmax(dim=-1),
+            "meta_probs": meta_probs,
+            "trade_probs": trade_probs,
+            "value": self.value_head(feature).squeeze(-1),
+            "carry": feature,
+        }
         for key in CONTINUOUS_KEYS:
             dist = self._beta_dist(key, feature)
-            actions[key] = ACTION_EPS + (1.0 - ACTION_EPS) * dist.mean
-        return actions, feature
+            mean = ACTION_EPS + (1.0 - ACTION_EPS) * dist.mean
+            out[key] = mean
+            out[f"{key}_mean"] = mean
+        return out
+
+    def value(
+        self, obs: dict[str, Tensor], carry: Optional[Tensor] = None
+    ) -> tuple[Tensor, Tensor]:
+        """Critic value ``[B]`` plus the new carry, WITH gradients.
+
+        The dream phase (Layer 4) regresses the value head through this
+        path, so unlike :meth:`act`/:meth:`mode` it must not run under
+        ``no_grad`` — gradients flow into the value head and the shared
+        torso. ``carry=None`` starts from :meth:`initial_carry`.
+        """
+        obs = self._prep(obs)
+        if carry is None:
+            carry = self.initial_carry(obs["market"].shape[0],
+                                       obs["market"].device)
+        feature = self._features(obs, carry)
+        return self.value_head(feature).squeeze(-1), feature

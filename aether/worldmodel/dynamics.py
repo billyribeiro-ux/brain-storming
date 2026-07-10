@@ -416,3 +416,11 @@ class RSSM(LatentDynamics):
     def num_parameters(self) -> int:
         """Total number of parameters (buffers excluded)."""
         return sum(p.numel() for p in self.parameters())
+
+
+#: Concrete implementation of the contract class of the same name.
+#: Consumers import ``LatentDynamics`` from THIS module (tests, dashboard,
+#: dream phase) and expect an instantiable ``LatentDynamics(cfg)`` — the
+#: interface in ``worldmodel.interfaces`` is only the abstract shape. The
+#: alias shadows the imported contract symbol on purpose.
+LatentDynamics = RSSM
