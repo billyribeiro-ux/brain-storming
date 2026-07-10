@@ -468,19 +468,63 @@ def page_trades() -> None:
                     autopsy_by_id.setdefault(tid, rep)
         st.subheader(f"Trades ({len(trades)})")
         if trades:
-            table = views.trades_table(trades)
-            st.dataframe(table, width="stretch", height=300)
-            ids = [str(t.get("trade_id", i)) for i, t in
-                   enumerate(views.filter_records(trades))]
-            marked = [f"{tid}  [autopsy]" if tid in autopsy_by_id else tid for tid in ids]
-            pick = st.selectbox("Inspect trade", range(len(ids)),
-                                format_func=lambda i: marked[i])
-            tid = ids[pick]
-            if tid in autopsy_by_id:
-                _render_autopsy(autopsy_by_id[tid])
+            # ---- period filter: entry date range over the trade list ------ #
+            all_dates = sorted({dt.date() for t in views.filter_records(trades)
+                                if (dt := views._to_dt(t.get("entry_ts"))) is not None})
+            if all_dates:
+                c1, c2 = st.columns([2, 3])
+                picked = c1.date_input(
+                    "Period (entry date, inclusive)",
+                    value=(all_dates[0], all_dates[-1]),
+                    min_value=all_dates[0], max_value=all_dates[-1],
+                )
+                # Mid-edit the widget yields a single date; treat it as both ends.
+                if isinstance(picked, (tuple, list)):
+                    start = picked[0] if len(picked) > 0 else all_dates[0]
+                    end = picked[1] if len(picked) > 1 else start
+                else:
+                    start = end = picked
+                tickers_in = sorted({str(t.get("ticker", "")) for t in
+                                     views.filter_records(trades)})
+                tick_pick = c2.multiselect("Tickers", tickers_in, default=tickers_in)
+
+                shown = [t for t in views.filter_records(
+                             trades, start=start, end=end, ts_keys=("entry_ts", "ts"))
+                         if str(t.get("ticker", "")) in set(tick_pick)]
             else:
-                st.info(f"No autopsy for trade {tid} (data/autopsies/{tid}.json). "
-                        "Autopsies are produced by the backtester for flagged trades.")
+                shown = views.filter_records(trades)
+
+            summary = views.trades_period_summary(shown)
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Trades in period", summary["n_trades"])
+            m2.metric("Net PnL", f"${summary['net_pnl']:,.2f}")
+            m3.metric("Win rate", f"{summary['win_rate']:.1%}")
+            m4.metric("Avg PnL/trade", f"${summary['avg_pnl']:,.2f}")
+            m5.metric("Fees", f"${summary['fees']:,.2f}")
+
+            table = views.trades_table(shown)
+            st.dataframe(table, width="stretch", height=300)
+            if len(table):
+                st.download_button(
+                    "Download shown trades (CSV)",
+                    table.to_csv(index=False).encode(),
+                    file_name=f"aether_trades_{name}.csv", mime="text/csv",
+                )
+
+            ids = [str(t.get("trade_id", i)) for i, t in enumerate(shown)]
+            if ids:
+                marked = [f"{tid}  [autopsy]" if tid in autopsy_by_id else tid
+                          for tid in ids]
+                pick = st.selectbox("Inspect trade", range(len(ids)),
+                                    format_func=lambda i: marked[i])
+                tid = ids[pick]
+                if tid in autopsy_by_id:
+                    _render_autopsy(autopsy_by_id[tid])
+                else:
+                    st.info(f"No autopsy for trade {tid} (data/autopsies/{tid}.json). "
+                            "Autopsies are produced by the backtester for flagged trades.")
+            else:
+                st.info("No trades in the selected period/tickers.")
         else:
             st.info("This backtest closed no trades.")
 

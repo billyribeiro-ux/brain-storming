@@ -120,3 +120,33 @@ class TestAppendFeedback:
             stored = by_id[entry["signal_id"]]
             assert entry.items() <= stored.items(), \
                 "stored feedback lost fields from the submitted entry"
+
+
+def test_filter_records_period_and_summary():
+    """Period (from/to) filtering on the trades list + the period summary
+    the dashboard's Trades page shows for the filtered window."""
+    views = pytest.importorskip("aether.dashboard.views")
+    trades = [
+        {"trade_id": "A1", "ticker": "AAPL", "entry_ts": 1781602320, "pnl": 10.0, "fees": 1.0},  # 2026-06-16
+        {"trade_id": "A2", "ticker": "AAPL", "entry_ts": 1782207120, "pnl": -5.0, "fees": 1.0},  # 2026-06-23
+        {"trade_id": "S1", "ticker": "SPY", "entry_ts": 1782811920, "pnl": 3.0, "fees": 1.0},    # 2026-06-30
+        {"trade_id": "X0", "ticker": "SPY", "pnl": 99.0},  # undated: excluded by time filters
+    ]
+    mid = views.filter_records(trades, start="2026-06-20", end="2026-06-29",
+                               ts_keys=("entry_ts",))
+    assert [t["trade_id"] for t in mid] == ["A2"]
+    # open-ended bounds
+    assert [t["trade_id"] for t in
+            views.filter_records(trades, end="2026-06-16", ts_keys=("entry_ts",))] == ["A1"]
+    assert [t["trade_id"] for t in
+            views.filter_records(trades, start="2026-06-30", ts_keys=("entry_ts",))] == ["S1"]
+    # inclusive on both ends; ticker filter composes
+    both = views.filter_records(trades, start="2026-06-16", end="2026-06-30",
+                                ticker="AAPL", ts_keys=("entry_ts",))
+    assert [t["trade_id"] for t in both] == ["A1", "A2"]
+    summary = views.trades_period_summary(mid)
+    assert summary == {"n_trades": 1, "net_pnl": -5.0, "win_rate": 0.0,
+                       "avg_pnl": -5.0, "fees": 1.0}
+    # empty window is well-defined, not an error
+    assert views.trades_period_summary([]) == {
+        "n_trades": 0, "net_pnl": 0.0, "win_rate": 0.0, "avg_pnl": 0.0, "fees": 0.0}

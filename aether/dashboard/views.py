@@ -629,9 +629,19 @@ def trades_table(trades: Iterable | None) -> pd.DataFrame:
 
 
 def filter_records(records: Iterable | None, ticker: str | None = None, date=None,
+                   start=None, end=None,
                    ts_keys: tuple[str, ...] = ("ts", "entry_ts")) -> list[dict]:
-    """Filter signal/trade dicts to one ticker and/or one session date."""
+    """Filter signal/trade dicts by ticker, one session date, or a period.
+
+    ``start``/``end`` bound an inclusive [start, end] date range on the
+    record's timestamp (first present key of ``ts_keys``); either side may be
+    open. ``date`` remains the single-session shorthand. Records without a
+    parseable timestamp are dropped whenever any time filter is active — an
+    undated trade cannot be proven to belong to the period.
+    """
     day = pd.Timestamp(date).date() if date is not None else None
+    lo = pd.Timestamp(start).date() if start is not None else None
+    hi = pd.Timestamp(end).date() if end is not None else None
     out = []
     for rec in records or []:
         d = _as_dict(rec)
@@ -639,13 +649,36 @@ def filter_records(records: Iterable | None, ticker: str | None = None, date=Non
             continue
         if ticker and str(d.get("ticker", "")) != str(ticker):
             continue
-        if day is not None:
+        if day is not None or lo is not None or hi is not None:
             ts = next((d.get(k) for k in ts_keys if d.get(k) is not None), None)
             dt = _to_dt(ts)
-            if dt is None or dt.date() != day:
+            if dt is None:
+                continue
+            if day is not None and dt.date() != day:
+                continue
+            if lo is not None and dt.date() < lo:
+                continue
+            if hi is not None and dt.date() > hi:
                 continue
         out.append(d)
     return out
+
+
+def trades_period_summary(trades: Iterable | None) -> dict:
+    """Aggregate stats for a (filtered) trade list — the numbers a trader
+    checks first when reviewing a period: count, net PnL, win rate, fees."""
+    pnls = [v for t in trades or []
+            if (v := _num(_as_dict(t).get("pnl"))) is not None]
+    fees = sum(v for t in trades or []
+               if (v := _num(_as_dict(t).get("fees"))) is not None)
+    n = len(pnls)
+    return {
+        "n_trades": n,
+        "net_pnl": round(sum(pnls), 2),
+        "win_rate": round(sum(1 for p in pnls if p > 0) / n, 4) if n else 0.0,
+        "avg_pnl": round(sum(pnls) / n, 2) if n else 0.0,
+        "fees": round(fees, 2),
+    }
 
 
 # --------------------------------------------------------------------------- #
