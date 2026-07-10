@@ -38,7 +38,6 @@
 	const SESSION_SECONDS = 390 * 60; // 09:30 → 16:00 ET
 
 	let ticker = $state('AAPL');
-	let date = $state('');
 	let speed = $state(120);
 	let busy = $state(false);
 	let actionError = $state<string | null>(null);
@@ -56,11 +55,14 @@
 		staleTime: Infinity
 	}));
 
-	// Default the date to the newest recorded session whenever the ticker's
-	// date list arrives (and re-default on ticker change).
-	$effect(() => {
+	// Date defaults to the newest recorded session; a user pick overrides it
+	// but silently falls back when it isn't in the current ticker's list.
+	let dateOverride = $state<string | null>(null);
+	const date = $derived.by(() => {
 		const dates = datesQ.data;
-		if (dates && dates.length > 0 && !dates.includes(date)) date = dates[dates.length - 1];
+		if (!dates || dates.length === 0) return '';
+		if (dateOverride !== null && dates.includes(dateOverride)) return dateOverride;
+		return dates[dates.length - 1];
 	});
 	const minDate = $derived(datesQ.data?.[0]);
 	const maxDate = $derived(datesQ.data?.at(-1));
@@ -80,7 +82,9 @@
 	}
 
 	// COUPLING (see header comment): follow the replayed instrument so the
-	// deck chart streams the same session the user just started.
+	// deck chart streams the same session the user just started. This is an
+	// intentional cross-store side effect — the global selection must track
+	// the replay — so $effect (not $derived) is the right tool here.
 	$effect(() => {
 		if (live.replay.running && live.replay.ticker) app.ticker = live.replay.ticker;
 	});
@@ -128,7 +132,8 @@
 				<input
 					type="date"
 					class={`num ${selectClass}`}
-					bind:value={date}
+					value={date}
+					onchange={(e) => (dateOverride = e.currentTarget.value)}
 					min={minDate}
 					max={maxDate}
 					disabled={datesQ.isPending || live.replay.running}

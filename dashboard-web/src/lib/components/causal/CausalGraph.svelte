@@ -2,8 +2,9 @@
 	/**
 	 * Force-directed view of the fitted causal graph. A tiny bespoke
 	 * simulation (pairwise repulsion + edge springs + cluster/center pull)
-	 * runs ~150 iterations once per snapshot inside an $effect, then the
-	 * layout is rendered statically — no continuous animation. Nodes are
+	 * runs ~150 iterations exactly once per snapshot (a $derived over the
+	 * snapshot prop), then the layout is rendered statically — no continuous
+	 * animation. Nodes are
 	 * hue-grouped by ticker prefix (MKT.* gets the amber/warn family), edges
 	 * are curved quadratics with arrowheads: green positive / red negative,
 	 * width ∝ |weight|·confidence, opacity ∝ bootstrap confidence.
@@ -50,17 +51,17 @@
 	// (matching the warn token family).
 	const HUES = [212, 158, 268, 322, 190, 246, 132, 292, 174, 226, 350, 98];
 
-	const colorByPrefix = $derived.by((): Map<string, string> => {
-		const map = new Map<string, string>();
+	const colorByPrefix = $derived.by((): Record<string, string> => {
+		const rec: Record<string, string> = {};
 		let i = 0;
 		for (const n of snapshot.nodes) {
 			const p = prefixOf(n);
-			if (map.has(p)) continue;
-			map.set(p, p === 'MKT' ? 'hsl(38 92% 60%)' : `hsl(${HUES[i++ % HUES.length]} 68% 62%)`);
+			if (p in rec) continue;
+			rec[p] = p === 'MKT' ? 'hsl(38 92% 60%)' : `hsl(${HUES[i++ % HUES.length]} 68% 62%)`;
 		}
-		return map;
+		return rec;
 	});
-	const colorOf = (node: string): string => colorByPrefix.get(prefixOf(node)) ?? 'hsl(212 68% 62%)';
+	const colorOf = (node: string): string => colorByPrefix[prefixOf(node)] ?? 'hsl(212 68% 62%)';
 
 	/* ---------------- force layout (precomputed, static render) -------- */
 
@@ -77,13 +78,13 @@
 		// golden-angle jitter seeds members around their anchor (no Math.random
 		// so the layout is stable across renders).
 		const prefixes = [...new Set(nodes.map(prefixOf))];
-		const anchor = new Map<string, Pt>();
+		const anchor: Record<string, Pt> = {};
 		prefixes.forEach((p, i) => {
 			const a = (i / prefixes.length) * 2 * Math.PI - Math.PI / 2;
-			anchor.set(p, { x: W / 2 + Math.cos(a) * W * 0.33, y: H / 2 + Math.sin(a) * H * 0.33 });
+			anchor[p] = { x: W / 2 + Math.cos(a) * W * 0.33, y: H / 2 + Math.sin(a) * H * 0.33 };
 		});
 		nodes.forEach((node, i) => {
-			const a = anchor.get(prefixOf(node)) ?? { x: W / 2, y: H / 2 };
+			const a = anchor[prefixOf(node)] ?? { x: W / 2, y: H / 2 };
 			const t = i * 2.399963;
 			ax[i] = a.x;
 			ay[i] = a.y;
@@ -93,15 +94,15 @@
 
 		// Springs: one per linked pair (dedup, self-loops excluded).
 		const springs: { a: number; b: number }[] = [];
-		const seen = new Set<string>();
+		const seen: Record<string, boolean> = {};
 		for (const e of edges) {
 			if (e.src === e.dst) continue;
 			const a = idx.get(e.src);
 			const b = idx.get(e.dst);
 			if (a === undefined || b === undefined) continue;
 			const key = a < b ? `${a}|${b}` : `${b}|${a}`;
-			if (seen.has(key)) continue;
-			seen.add(key);
+			if (seen[key]) continue;
+			seen[key] = true;
 			springs.push({ a, b });
 		}
 
@@ -163,11 +164,8 @@
 		return out;
 	}
 
-	let positions = $state<Record<string, Pt>>({});
-
-	$effect(() => {
-		positions = simulate(snapshot.nodes, snapshot.edges);
-	});
+	// Recomputed exactly once per snapshot; the render itself is static.
+	const positions = $derived.by(() => simulate(snapshot.nodes, snapshot.edges));
 
 	/* ---------------- drawn geometry ---------------- */
 
@@ -242,13 +240,16 @@
 	let hovered = $state<string | null>(null);
 
 	const neighbors = $derived.by((): Set<string> => {
-		const s = new Set<string>();
-		if (!hovered) return s;
-		for (const d of drawn) {
-			if (d.e.src === hovered) s.add(d.e.dst);
-			if (d.e.dst === hovered) s.add(d.e.src);
-		}
-		return s;
+		const h = hovered;
+		if (!h) return new Set<string>();
+		return new Set(
+			drawn.flatMap((d) => {
+				const linked: string[] = [];
+				if (d.e.src === h) linked.push(d.e.dst);
+				if (d.e.dst === h) linked.push(d.e.src);
+				return linked;
+			})
+		);
 	});
 
 	const edgeOpacity = (d: DrawnEdge): number => {
@@ -275,7 +276,8 @@
 
 	/* ---------------- zoom / pan (viewBox) ---------------- */
 
-	let svgEl = $state<SVGSVGElement | null>(null);
+	// Plain (non-reactive) element ref: only read inside event handlers.
+	let svgEl: SVGSVGElement | null = null;
 	let cw = $state(0);
 	let ch = $state(0);
 	let vb = $state({ x: 0, y: 0, w: W, h: H });
@@ -318,12 +320,15 @@
 	}
 
 	// Svelte 5 registers `onwheel` passively; zoom needs preventDefault, so
-	// attach a non-passive listener manually.
-	$effect(() => {
-		const el = svgEl;
-		if (!el) return;
-		return on(el, 'wheel', handleWheel, { passive: false });
-	});
+	// attach a non-passive listener via an attachment (also captures the ref).
+	function wheelZoom(el: SVGSVGElement): () => void {
+		svgEl = el;
+		const off = on(el, 'wheel', handleWheel, { passive: false });
+		return () => {
+			off();
+			svgEl = null;
+		};
+	}
 
 	function onPointerDown(ev: PointerEvent): void {
 		if (ev.button !== 0 || !svgEl) return;
@@ -382,7 +387,7 @@
 	</p>
 
 	<svg
-		bind:this={svgEl}
+		{@attach wheelZoom}
 		viewBox={`${vb.x} ${vb.y} ${vb.w} ${vb.h}`}
 		preserveAspectRatio="xMidYMid meet"
 		class={`h-full w-full touch-none select-none ${panning ? 'cursor-grabbing' : 'cursor-grab'}`}

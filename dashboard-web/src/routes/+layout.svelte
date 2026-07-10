@@ -4,8 +4,8 @@
 	 * Owns the QueryClient and the WebSocket lifecycle.
 	 */
 	import '../app.css';
-	import '@fontsource-variable/inter';
-	import '@fontsource/jetbrains-mono';
+	import '@fontsource-variable/inter/index.css';
+	import '@fontsource/jetbrains-mono/index.css';
 	import favicon from '$lib/assets/favicon.svg';
 	import { QueryClient, QueryClientProvider } from '@tanstack/svelte-query';
 	import { onMount } from 'svelte';
