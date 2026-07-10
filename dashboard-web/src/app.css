@@ -1,0 +1,94 @@
+@import 'tailwindcss';
+
+/* ------------------------------------------------------------------ */
+/* Aether institutional design system                                   */
+/* Deep-space blacks, electric blue accent, semantic long/short greens  */
+/* and reds, glass panels. All components consume these tokens only —   */
+/* never raw hex — so the theme stays coherent.                         */
+/* ------------------------------------------------------------------ */
+
+@theme {
+	/* Surfaces */
+	--color-void: #04060c; /* page background            */
+	--color-abyss: #070b14; /* sidebar / topbar           */
+	--color-surface: #0b1020; /* panel body                 */
+	--color-raised: #111830; /* hover / raised surfaces    */
+	--color-hairline: rgba(148, 163, 216, 0.10); /* borders   */
+	--color-hairline-strong: rgba(148, 163, 216, 0.22);
+
+	/* Text */
+	--color-ink: #e6eaf6; /* primary text               */
+	--color-ink-dim: #8b93ad; /* secondary text             */
+	--color-ink-faint: #566078; /* tertiary / labels          */
+
+	/* Accents */
+	--color-accent: #4f8cff; /* electric blue              */
+	--color-accent-soft: rgba(79, 140, 255, 0.14);
+	--color-long: #2fd08c; /* long / win                 */
+	--color-long-soft: rgba(47, 208, 140, 0.14);
+	--color-short: #ff5d6c; /* short / loss               */
+	--color-short-soft: rgba(255, 93, 108, 0.14);
+	--color-warn: #f5b054;
+	--color-warn-soft: rgba(245, 176, 84, 0.14);
+
+	/* Typography */
+	--font-sans: 'Inter Variable', 'Inter', ui-sans-serif, system-ui, sans-serif;
+	--font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
+}
+
+html {
+	background: var(--color-void);
+	color: var(--color-ink);
+	font-family: var(--font-sans);
+	font-feature-settings: 'cv02', 'cv03', 'cv11';
+	scrollbar-color: var(--color-raised) transparent;
+}
+
+/* Numeric data always tabular + mono for column alignment. */
+.num {
+	font-family: var(--font-mono);
+	font-variant-numeric: tabular-nums;
+}
+
+/* Glass panel shell — the one visual primitive every panel shares. */
+.glass {
+	background: linear-gradient(180deg, rgba(17, 24, 48, 0.55), rgba(11, 16, 32, 0.85));
+	border: 1px solid var(--color-hairline);
+	border-radius: 0.75rem;
+	backdrop-filter: blur(14px);
+}
+
+.glass-hover:hover {
+	border-color: var(--color-hairline-strong);
+	transition: border-color 150ms ease;
+}
+
+/* Subtle rise-in used sparingly (panels on mount). Honors reduced motion. */
+@keyframes rise-in {
+	from {
+		opacity: 0;
+		transform: translateY(6px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+.rise-in {
+	animation: rise-in 320ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+	.rise-in {
+		animation: none;
+	}
+}
+
+/* Thin scrollbars inside panels. */
+.scroll-thin::-webkit-scrollbar {
+	width: 6px;
+	height: 6px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+	background: var(--color-raised);
+	border-radius: 3px;
+}
