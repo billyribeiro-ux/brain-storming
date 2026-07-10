@@ -565,6 +565,11 @@ def snapshot_from_json(text: str) -> CausalGraphSnapshot:
 # and there is exactly one serialization code path.
 CausalGraphSnapshot.to_json = snapshot_to_json  # type: ignore[method-assign]
 
+#: Contract-named module-level alias ("from_json(str) -> CausalGraphSnapshot
+#: (module-level function)" per worldmodel.interfaces); consumers such as
+#: scripts/run_backtest.py call ``causal.from_json``.
+from_json = snapshot_from_json
+
 
 #: Filename-safe characters for the snapshot timestamp. ISO timestamps map
 #: ":" -> "-" (fixed width), so lexicographic filename order still equals

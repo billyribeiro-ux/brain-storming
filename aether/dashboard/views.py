@@ -383,8 +383,14 @@ def _saliency_scores(saliency: Any, bar_times: pd.Series) -> np.ndarray | None:
     return out
 
 
-def candles_figure(store, ticker: str, date, overlays: dict | None = None) -> go.Figure:
+def candles_figure(store, ticker: str = "", date=None,
+                   overlays: dict | None = None) -> go.Figure:
     """1-min candlestick + volume for one session, with optional overlays.
+
+    ``store`` may be either a ParquetStore-like object (then ``ticker`` and
+    ``date`` select the session to read) or an already-materialized OHLCV
+    DataFrame (lake convention columns), in which case ``date`` defaults to
+    the frame's first session.
 
     ``overlays`` (all optional, all shape-tolerant):
       signals: list of dicts with ts / side / entry(_px) / stop(_px) / target(_px)
@@ -392,12 +398,21 @@ def candles_figure(store, ticker: str, date, overlays: dict | None = None) -> go
       saliency: per-bar scores (sequence aligned to session bars, or {ts: score})
     """
     overlays = overlays or {}
-    day = pd.Timestamp(date).normalize()
-    try:
-        bars = store.read("bars_1min", ticker, start=day,
-                          end=day + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))
-    except Exception:
-        bars = pd.DataFrame()
+    if isinstance(store, pd.DataFrame):
+        bars = store
+        if date is not None:
+            day = pd.Timestamp(date).normalize()
+        elif len(bars) and "date" in bars.columns:
+            day = pd.Timestamp(bars["date"].iloc[0]).normalize()
+        else:
+            day = pd.Timestamp.now().normalize()
+    else:
+        day = pd.Timestamp(date).normalize()
+        try:
+            bars = store.read("bars_1min", ticker, start=day,
+                              end=day + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))
+        except Exception:
+            bars = pd.DataFrame()
     if bars is None or len(bars) == 0 or "date" not in getattr(bars, "columns", []):
         return _empty_figure(f"No 1min bars for {ticker} on {day.date()}")
 
@@ -637,9 +652,19 @@ def filter_records(records: Iterable | None, ticker: str | None = None, date=Non
 # Causal graph
 # --------------------------------------------------------------------------- #
 
-def _snapshot_edges(snapshot: Mapping | None) -> list[dict]:
+def _snapshot_dict(snapshot: Any) -> dict:
+    """Causal snapshot -> plain dict, tolerating the CausalGraphSnapshot
+    dataclass, mappings and None alike."""
+    if snapshot is None:
+        return {}
+    if isinstance(snapshot, Mapping):
+        return dict(snapshot)
+    return _as_dict(snapshot)
+
+
+def _snapshot_edges(snapshot: Any) -> list[dict]:
     edges = []
-    for e in (snapshot or {}).get("edges") or []:
+    for e in _snapshot_dict(snapshot).get("edges") or []:
         d = _as_dict(e)
         src, dst = str(d.get("src", "")), str(d.get("dst", ""))
         w, conf = _num(d.get("weight")), _num(d.get("confidence"))
@@ -666,7 +691,7 @@ def causal_figure(snapshot: Mapping | None, max_edges: int = 120) -> go.Figure:
     import networkx as nx  # lazy
 
     edges = sorted(_snapshot_edges(snapshot), key=lambda e: -e["strength"])[:max_edges]
-    nodes = [str(n) for n in (snapshot or {}).get("nodes") or []]
+    nodes = [str(n) for n in _snapshot_dict(snapshot).get("nodes") or []]
     nodes = sorted(set(nodes) | {e["src"] for e in edges} | {e["dst"] for e in edges})
     if not nodes:
         return _empty_figure("Empty causal snapshot")
@@ -817,28 +842,48 @@ def imagination_fanchart(fused_traj: np.ndarray) -> go.Figure:
 # Training curves
 # --------------------------------------------------------------------------- #
 
-def training_curves(runs_dir: str | Path) -> dict[str, pd.DataFrame]:
-    """Parse every runs/*.jsonl into a DataFrame of step + numeric fields.
+def _training_frame(path: Path) -> pd.DataFrame | None:
+    """One runs/*.jsonl -> DataFrame of step + numeric fields (None if empty).
     Robust to malformed lines and non-numeric fields."""
+    rows = []
+    for rec in _read_jsonl(path):
+        if "step" not in rec:
+            continue
+        row = {}
+        for k, v in rec.items():
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            if math.isfinite(float(v)):
+                row[k] = float(v)
+        if "step" in row:
+            rows.append(row)
+    if not rows:
+        return None
+    return pd.DataFrame(rows).sort_values("step").reset_index(drop=True)
+
+
+def training_curves(runs: str | Path):
+    """Training-curve view over JSONL run logs (malformed lines skipped).
+
+    * ``runs`` is a DIRECTORY: parse every ``*.jsonl`` inside it and return
+      ``{stem: DataFrame}`` (the dashboard app picks metrics per file).
+    * ``runs`` is a single ``.jsonl`` FILE: return one plotly Figure of all
+      its numeric metrics directly.
+    """
+    runs = Path(runs)
+    if runs.is_file():
+        df = _training_frame(runs)
+        if df is None:
+            return _empty_figure(f"No parsable training records in {runs.name}")
+        metrics = [c for c in df.columns if c != "step"]
+        return training_curve_figure(df, metrics, title=runs.stem)
     out: dict[str, pd.DataFrame] = {}
-    runs = Path(runs_dir)
     if not runs.is_dir():
         return out
     for path in sorted(runs.glob("*.jsonl")):
-        rows = []
-        for rec in _read_jsonl(path):
-            if "step" not in rec:
-                continue
-            row = {}
-            for k, v in rec.items():
-                if isinstance(v, bool) or not isinstance(v, (int, float)):
-                    continue
-                if math.isfinite(float(v)):
-                    row[k] = float(v)
-            if "step" in row:
-                rows.append(row)
-        if rows:
-            out[path.stem] = pd.DataFrame(rows).sort_values("step").reset_index(drop=True)
+        df = _training_frame(path)
+        if df is not None:
+            out[path.stem] = df
     return out
 
 

@@ -258,11 +258,18 @@ class Autopsist:
 
         Every variation changes EXACTLY ONE thing (entry timing, stop
         distance, target distance, or exit discipline) while holding the
-        rest of the plan fixed, so each delta isolates one decision. The
-        policy's chosen exit moment (``exit_ts``) is kept as the forced
-        horizon for all bracketed variants — we are grading the bracket,
-        not inventing a new exit policy — except the explicit hold-longer
-        variant, which extends the horizon by 30 minutes.
+        rest of the plan fixed, so each delta isolates one decision.
+
+        Horizon semantics (documented decision): every variant may play its
+        bracket out until ``exit_ts + HOLD_EXTRA_SECONDS`` (30 minutes past
+        the actual exit), NOT merely until the actual exit. Avoidability is
+        the question "would a nearby variation of the plan have survived and
+        profited within a short window after the trade actually died?" —
+        pinning the horizon to the actual exit would cut every variant off
+        at the precise moment the original stop fired, structurally blinding
+        the verdict to rescues (a stopped-out trade could never earn
+        ``bad_loss``). Entry-later shifts are legitimate variations even
+        when the shifted fill postdates the actual exit.
         """
         direction = _direction(trade.side)
         entry_idx = path.index_at(trade.entry_ts)
@@ -272,6 +279,7 @@ class Autopsist:
             return []
         stop_dist = abs(trade.entry_px - trade.stop_px)
         target_dist = abs(trade.target_px - trade.entry_px)
+        horizon_ts = trade.exit_ts + HOLD_EXTRA_SECONDS
 
         out: list[Counterfactual] = []
 
@@ -286,15 +294,15 @@ class Autopsist:
             desc = f"enter {abs(shift)} bars {when}"
             j = entry_idx + shift
             # Skip impossible timings instead of faking them: before the
-            # provided history, after the data, or at/after the policy exit.
-            if j < 0 or j >= len(path) or path.ts[j] >= trade.exit_ts:
+            # provided history, or past the data / the variant horizon.
+            if j < 0 or j >= len(path) or path.ts[j] >= horizon_ts:
                 logger.warning("autopsy %s: '%s' outside the bar path — "
                                "skipped", trade.trade_id, desc)
                 continue
             fill = float(path.close[j])
             add(desc, simulate_bracket(
                 path, trade.side, j, fill, trade.qty, trade.fees,
-                horizon_ts=trade.exit_ts,
+                horizon_ts=horizon_ts,
                 stop_px=fill - direction * stop_dist,
                 target_px=fill + direction * target_dist))
 
@@ -302,7 +310,7 @@ class Autopsist:
         for scale in BRACKET_SCALES:
             add(f"stop at {scale:g}x distance", simulate_bracket(
                 path, trade.side, entry_idx, trade.entry_px, trade.qty,
-                trade.fees, horizon_ts=trade.exit_ts,
+                trade.fees, horizon_ts=horizon_ts,
                 stop_px=trade.entry_px - direction * stop_dist * scale,
                 target_px=trade.target_px))
 
@@ -310,14 +318,14 @@ class Autopsist:
         for scale in BRACKET_SCALES:
             add(f"target at {scale:g}x distance", simulate_bracket(
                 path, trade.side, entry_idx, trade.entry_px, trade.qty,
-                trade.fees, horizon_ts=trade.exit_ts,
+                trade.fees, horizon_ts=horizon_ts,
                 stop_px=trade.stop_px,
                 target_px=trade.entry_px + direction * target_dist * scale))
 
         # --- discipline: hold to exit+30min, no stop, no target ------------
         add("hold to exit+30min with no stop", simulate_bracket(
             path, trade.side, entry_idx, trade.entry_px, trade.qty,
-            trade.fees, horizon_ts=trade.exit_ts + HOLD_EXTRA_SECONDS,
+            trade.fees, horizon_ts=horizon_ts,
             stop_px=None, target_px=None))
         return out
 

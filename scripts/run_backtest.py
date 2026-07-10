@@ -138,6 +138,9 @@ def load_dynamics():
     """Latent dynamics from the first checkpoint found in the usual spots,
     or None (module missing, no artifact, or incompatible layout)."""
     candidates = [
+        # scripts/train_worldmodel.py writes {model, cfg, step} here:
+        Path("checkpoints/worldmodel/best.pt"),
+        Path("checkpoints/worldmodel/last.pt"),
         *sorted(Path("checkpoints/worldmodel").glob("*dynamics*.pt")),
         Path("checkpoints/dynamics/best.pt"),
         Path("checkpoints/dynamics/last.pt"),

@@ -166,6 +166,14 @@ class SelfDiagnosis:
         )
         return report
 
+    def diagnose(self) -> list[DiagnosisFinding]:
+        """Run :meth:`scan` and return just the findings list.
+
+        Convenience surface for callers (and the stack test suite) that
+        only need the findings, not the full report envelope.
+        """
+        return self.scan().findings
+
     # ------------------------------------------------------------------ #
     # Log loading (robustness layer)
     # ------------------------------------------------------------------ #
@@ -232,8 +240,16 @@ class SelfDiagnosis:
         model has genuinely regressed (not just wiggled) — usually LR too
         hot late in training, or a data/regime shift mid-run. Skipped for
         short traces and for non-positive losses (ratios are meaningless).
+
+        Key spellings: the perception trainer logs ``val_total``; other
+        trainers (and external logs) commonly write ``val_loss`` — the
+        first spelling with data wins.
         """
-        pts = _finite_points(records, "step", "val_total")
+        pts: list[tuple[float, float]] = []
+        for val_key in ("val_total", "val_loss"):
+            pts = _finite_points(records, "step", val_key)
+            if pts:
+                break
         if len(pts) < self.MIN_POINTS:
             return []
         best = min(v for _, v in pts)
