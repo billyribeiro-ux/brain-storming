@@ -119,7 +119,17 @@ def build_param_groups(
     * **learned tokens/latents** (mask token, fusion latent queries,
       positional embeddings) — these are free vectors whose *position* in
       representation space is the whole point; zero is not a meaningful
-      prior for them.
+      prior for them,
+    * **state-space dynamics parameters** (the S4D layer's ``log_A_re``,
+      ``A_im``, ``B_re/B_im``, ``C_re/C_im``) — these are ``[H, N]`` 2-D
+      tensors, but they parameterize a dynamical system, not a
+      feature-mixing map. L2-toward-zero is a meaningless prior for them:
+      decaying ``A_im`` collapses every state's oscillation frequency
+      toward 0 (destroying the S4D-Lin harmonic basis) and decaying
+      ``log_A_re`` pulls the decay *rate* toward the arbitrary value
+      ``-Re(A)=e^0=1`` rather than toward "less capacity". The reference
+      S4/S4D implementations register A/B with ``weight_decay=0`` for
+      exactly this reason.
 
     Classification rules, applied in order:
 
@@ -129,7 +139,8 @@ def build_param_groups(
        scalar/vector tokens such as the model's ``mask_token``) → no decay,
     3. any parameter whose name contains ``token``, ``latent`` or
        ``pos_emb`` (learned queries / positional tables that are ≥2-D and
-       so slip past rule 2) → no decay,
+       so slip past rule 2), or that lives inside an S4D layer (name
+       contains ``s4d``) → no decay,
     4. everything else (true weight matrices, conv kernels) → decay.
     """
     # Norm classes to exempt. `_NormBase` covers all BatchNorm/InstanceNorm
@@ -164,6 +175,7 @@ def build_param_groups(
             or "token" in lowered               # rule 3
             or "latent" in lowered
             or "pos_emb" in lowered
+            or "s4d" in lowered                 # rule 3: SSM dynamics params
         ):
             no_decay.append(param)
         else:
@@ -371,8 +383,27 @@ class PerceptionTrainer:
             return torch.autocast(self.device.type, dtype=self.amp_dtype)
         return nullcontext()
 
-    def _train_step(self, batch: PerceptionBatch) -> dict[str, float]:
-        """One optimizer step; returns the (detached) loss dictionary."""
+    def _train_step(
+        self, batch: PerceptionBatch
+    ) -> tuple[dict[str, float], bool]:
+        """One optimizer step attempt.
+
+        Returns ``(losses, applied)`` where ``applied`` is False when the
+        fp16 :class:`GradScaler` detected inf/NaN gradients and *skipped*
+        ``optimizer.step()``. On a skipped step the LR scheduler and EMA are
+        deliberately NOT advanced: stepping the schedule for an update that
+        never happened would drift the warmup/cosine curve away from the
+        count of *effective* optimizer steps (and folding unchanged weights
+        into the EMA is pure waste). The caller likewise must not count a
+        skipped step toward ``max_steps``.
+
+        Skip detection: ``GradScaler.update()`` multiplies the scale by
+        ``backoff_factor < 1`` if (and only if) the preceding ``step()``
+        found non-finite gradients; growth events only ever *increase* it.
+        So ``scale_after < scale_before`` <=> the step was skipped. With the
+        scaler disabled (CPU / bf16-irrelevant / no AMP), ``get_scale()`` is
+        the constant 1.0 and every step reports as applied.
+        """
         self.optimizer.zero_grad(set_to_none=True)
 
         with self._autocast():
@@ -393,12 +424,16 @@ class PerceptionTrainer:
                 self.model.parameters(), self.cfg.grad_clip
             )
 
+        scale_before = self.scaler.get_scale()
         self.scaler.step(self.optimizer)   # skips the step on inf/nan (fp16)
         self.scaler.update()
-        self.scheduler.step()              # per-step (not per-epoch) schedule
-        self.ema.update(self.model)
+        applied = self.scaler.get_scale() >= scale_before
 
-        return {k: float(v.detach()) for k, v in losses.items()}
+        if applied:
+            self.scheduler.step()          # per-step (not per-epoch) schedule
+            self.ema.update(self.model)
+
+        return {k: float(v.detach()) for k, v in losses.items()}, applied
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -460,9 +495,30 @@ class PerceptionTrainer:
             cfg.val_every,
         )
 
+        skipped_in_row = 0  # consecutive GradScaler overflow-skips (fp16)
         while self.step < cfg.max_steps:
             batch = next(train_iter).to(self.device)
-            last_train = self._train_step(batch)
+            last_train, applied = self._train_step(batch)
+            if not applied:
+                # fp16 overflow: the optimizer step was skipped, so it must
+                # not count toward max_steps (nor advance the LR schedule —
+                # _train_step already withheld scheduler/EMA updates). A
+                # long unbroken run of skips means the loss itself is
+                # NaN/inf (rescaling cannot fix that) — fail loudly rather
+                # than spin forever.
+                skipped_in_row += 1
+                self.logger.warning(
+                    "step %d: GradScaler skipped the optimizer step "
+                    "(inf/NaN grads, %d in a row) — not counted",
+                    self.step, skipped_in_row,
+                )
+                if skipped_in_row >= 100:
+                    raise RuntimeError(
+                        "training diverged: 100 consecutive GradScaler "
+                        "overflow-skips — the loss is likely NaN/inf"
+                    )
+                continue
+            skipped_in_row = 0
             self.step += 1
             lr = self.optimizer.param_groups[0]["lr"]
 

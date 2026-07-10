@@ -457,14 +457,27 @@ def fit_or_load_stats(store: ParquetStore, tickers: list[str],
                       stats_root: Path) -> dict[str, TickerStats]:
     """Load cached :class:`TickerStats` or fit them from the lake.
 
-    A cached JSON is reused only if its fitted range *covers* the requested
-    training range — a cache fitted on less data than requested would be a
-    different (weaker) fingerprint, while one fitted on a superset range
-    would leak nothing new but is rejected too if it starts later or ends
-    earlier than requested.  Fitting reads ONLY ``[train_start, train_end]``
-    from the lake: the frozen stats are the sole channel through which
-    training data influences validation preprocessing, and no channel exists
-    in the other direction.
+    A cached JSON is reused ONLY if its fitted range matches the requested
+    training range **exactly** (both endpoints, day-granular). Anything
+    looser is a correctness hazard, not a convenience:
+
+    * a cache fitted on *less* data than requested is a different (weaker)
+      fingerprint;
+    * a cache whose ``fitted_end`` extends PAST the requested ``train_end``
+      was fitted on dates the current run may be using as validation — its
+      volume smiles, volatility means, and clip bounds would silently bake
+      future/validation data into the normalization of every window, a
+      textbook look-ahead leak (this exact collision arises naturally in
+      walk-forward experimentation, where successive runs share
+      ``stats_root`` but shrink the train range);
+    * a cache whose ``fitted_start`` predates the requested ``train_start``
+      is not a *leak* (only past data), but it is a different fingerprint
+      than the one asked for — exactness keeps the cache semantics trivial
+      to reason about, and a refit is cheap.
+
+    Fitting reads ONLY ``[train_start, train_end]`` from the lake: the
+    frozen stats are the sole channel through which training data influences
+    validation preprocessing, and no channel exists in the other direction.
     """
     stats_root = Path(stats_root)
     stats_root.mkdir(parents=True, exist_ok=True)
@@ -477,12 +490,17 @@ def fit_or_load_stats(store: ParquetStore, tickers: list[str],
         if path.is_file():
             try:
                 st = TickerStats.from_json(path)
-                if (pd.Timestamp(st.fitted_start) <= t_start
-                        and pd.Timestamp(st.fitted_end) >= t_end):
+                # Exact-range match required. In particular fitted_end must
+                # NOT exceed t_end: a superset cache was fitted on dates that
+                # may be this run's validation period, and reusing it would
+                # leak future statistics into normalization (no-look-ahead
+                # invariant). See the docstring above.
+                if (pd.Timestamp(st.fitted_start) == t_start
+                        and pd.Timestamp(st.fitted_end) == t_end):
                     out[alias] = st
                     continue
-                logger.info("stats: %s cache range [%s, %s] does not cover "
-                            "train range [%s, %s] — refitting", alias,
+                logger.info("stats: %s cache range [%s, %s] does not exactly "
+                            "match train range [%s, %s] — refitting", alias,
                             st.fitted_start, st.fitted_end,
                             train_start, train_end)
             except Exception as exc:  # corrupt/stale cache file
@@ -528,11 +546,40 @@ def build_dataloaders(cfg: AetherConfig, perception_cfg: PerceptionConfig,
 
     * ``TickerStats`` are fitted (or loaded) on the TRAIN range only and
       shared with the validation dataset — the leak-free direction.
+    * The temporal split is validated here — this function is the single
+      seam where train/val ranges meet, and an overlapping (or inverted)
+      split would silently produce in-sample "validation" that then drives
+      ``best.pt`` model selection in the trainer. Day-granular overlap
+      raises ``ValueError``.
     * The train loader shuffles (with a seeded generator for reproducible
       epochs); validation preserves time order for readable eval traces.
     * ``pin_memory`` follows CUDA availability; the code itself stays
       device-agnostic.
+
+    Raises
+    ------
+    ValueError
+        If ``val_range`` does not start strictly after ``train_range`` ends
+        (compared at day granularity), or either range is inverted.
     """
+    train_start = pd.Timestamp(train_range[0]).normalize()
+    train_end = pd.Timestamp(train_range[1]).normalize()
+    val_start = pd.Timestamp(val_range[0]).normalize()
+    val_end = pd.Timestamp(val_range[1]).normalize()
+    if train_end < train_start or val_end < val_start:
+        raise ValueError(
+            f"build_dataloaders: inverted date range — train "
+            f"[{train_range[0]}, {train_range[1]}], val "
+            f"[{val_range[0]}, {val_range[1]}]")
+    if val_start <= train_end:
+        # Overlap is not merely cosmetic: validation losses select best.pt,
+        # so an in-sample val set biases model selection with no warning.
+        raise ValueError(
+            "build_dataloaders: validation must start strictly after the "
+            f"training range ends (train ends {train_end.date()}, val "
+            f"starts {val_start.date()}) — overlapping splits leak training "
+            "dates into validation")
+
     store = ParquetStore(cfg.data.root)
     tickers = [t.alias for t in TICKERS]
     stats = fit_or_load_stats(store, tickers, train_range[0], train_range[1],

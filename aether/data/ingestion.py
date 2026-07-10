@@ -24,6 +24,9 @@ Core mechanics
   :meth:`IngestionEngine.sync` fetches only *after* the high watermark minus
   a two-day overlap, so late-settling bars (vendor restatements, delayed
   prints) are re-merged; the lake's dedup-on-write makes the overlap free.
+  Sync marches *forwards* (oldest chunk first) so the high watermark only
+  advances over contiguously covered ground — an interrupted multi-chunk
+  sync therefore never strands an unfillable hole below the watermark.
 
 * **Capability awareness.** Endpoints this key's plan cannot reach are
   recorded in ``capabilities.json`` — either proactively by
@@ -440,10 +443,18 @@ class IngestionEngine:
                                stop_on_empty: bool) -> int:
         """Fetch [start, end] in chunks, newest chunk first, writing each.
 
-        Marching *backwards* means the most recent (most valuable) data
-        lands first and an interrupted run leaves a contiguous
-        [low_watermark, end] block behind — exactly what the resume logic in
-        :meth:`_backfill_window` expects.
+        **Backfill only.** Marching *backwards* means the most recent (most
+        valuable) data lands first and an interrupted run leaves a
+        contiguous [low_watermark, end] block behind — exactly what the
+        resume logic in :meth:`_backfill_window` expects.
+
+        Sync must NOT use this direction: its resume logic keys off the
+        *high* watermark, which the newest-first chunk pushes to ~today
+        immediately; a failure on any later (older) chunk would then strand
+        a hole below the new high watermark that neither future syncs
+        (which start at high_wm - overlap) nor backfill (which extends only
+        below the *low* watermark) would ever refetch. Sync marches
+        oldest-first via :meth:`_march_forwards` instead.
 
         ``chunk_start_of`` maps a chunk's end date to its natural start
         (fixed span for bars/treasury, first-of-month for news); the true
@@ -478,13 +489,69 @@ class IngestionEngine:
                     dataset, key, n_chunks, rows_new)
         return rows_new
 
+    async def _march_forwards(self, dataset: str, key: str,
+                              fetch: FetchFn, write: WriteFn,
+                              start: date, end: date,
+                              chunk_end_of: Callable[[date], date]) -> int:
+        """Fetch [start, end] in chunks, OLDEST chunk first, writing each.
+
+        **Sync only.** Sync resumes from the *high* watermark
+        (:meth:`_sync_window`), so the invariant that keeps an interrupted
+        run self-healing is: *the high watermark never advances past ground
+        that is contiguously covered from the previous watermark.* Marching
+        oldest-first preserves it — each written chunk extends coverage
+        (and the watermark) forward from the last one, so a crash or an
+        exhausted-retries failure on chunk k leaves the lake contiguous
+        through chunk k-1 and the next sync's ``high_wm - overlap`` window
+        re-covers exactly the missing tail. (A newest-first sync would push
+        the watermark to ~today on its first chunk and permanently strand
+        any older chunks that failed — an unfillable hole.)
+
+        ``chunk_end_of`` maps a chunk's start date to its natural end
+        (fixed span for bars/treasury, last-of-month for news); the true
+        end is clamped to ``end``.
+
+        There is no ``stop_on_empty`` here: an empty chunk inside a sync
+        window is normal (weekends/holidays, quiet news weeks) and can
+        never mean "front of vendor history" — the window starts at data we
+        already hold.
+        """
+        rows_new = 0
+        n_chunks = 0
+        cursor_start = start
+        while cursor_start <= end:
+            chunk_end = min(end, chunk_end_of(cursor_start))
+            df = await fetch(cursor_start, chunk_end)
+            n_chunks += 1
+            if df is not None and not df.empty:
+                rows_new += write(df).rows_new
+            # Continue strictly after this chunk. chunk_end >= cursor_start
+            # always holds, so the cursor strictly increases => terminates.
+            cursor_start = chunk_end + timedelta(days=1)
+        logger.info("%s/%s: forward march finished (%d chunks, +%d new rows)",
+                    dataset, key, n_chunks, rows_new)
+        return rows_new
+
+    @staticmethod
+    def _month_end(d: date) -> date:
+        """Last calendar day of ``d``'s month (for month-sized news chunks)."""
+        first_next = (date(d.year + 1, 1, 1) if d.month == 12
+                      else date(d.year, d.month + 1, 1))
+        return first_next - timedelta(days=1)
+
     # ------------------------------------------------------------------ #
     # Mode-specific strategies
     # ------------------------------------------------------------------ #
 
     async def _ingest_intraday(self, client: FMPClient, spec: EndpointSpec,
                                tspec: TickerSpec, phase: str) -> int:
-        """1min/5min bars: ~30-day chunks of backward-paginated history."""
+        """1min/5min bars: ~30-day chunks, direction chosen by phase.
+
+        Backfill marches backwards (newest first, resumable via the low
+        watermark); sync marches forwards (oldest first) so the high
+        watermark only ever advances over contiguously covered ground — see
+        the two march methods for the full rationale.
+        """
         interval = spec.path.rsplit("/", 1)[-1]  # "1min" | "5min"
         window = self._window_for(phase, spec.dataset, tspec.alias)
         if window is None:
@@ -498,6 +565,11 @@ class IngestionEngine:
             return self.store.write(spec.dataset, tspec.alias, df,
                                     dedup_keys=spec.dedup_keys)
 
+        if phase == "sync":
+            return await self._march_forwards(
+                spec.dataset, tspec.alias, fetch, write, start, end,
+                chunk_end_of=lambda cs: cs + timedelta(days=INTRADAY_CHUNK_DAYS - 1),
+            )
         return await self._march_backwards(
             spec.dataset, tspec.alias, fetch, write, start, end,
             chunk_start_of=lambda ce: ce - timedelta(days=INTRADAY_CHUNK_DAYS - 1),
@@ -545,6 +617,13 @@ class IngestionEngine:
             return self.store.write(spec.dataset, MARKET_PSEUDO_TICKER, df,
                                     dedup_keys=spec.dedup_keys)
 
+        if phase == "sync":
+            # Forward march: keeps the high watermark contiguous if a chunk
+            # fails mid-run (see _march_forwards).
+            return await self._march_forwards(
+                spec.dataset, MARKET_PSEUDO_TICKER, fetch, write, start, end,
+                chunk_end_of=lambda cs: cs + timedelta(days=TREASURY_CHUNK_DAYS - 1),
+            )
         return await self._march_backwards(
             spec.dataset, MARKET_PSEUDO_TICKER, fetch, write, start, end,
             chunk_start_of=lambda ce: ce - timedelta(days=TREASURY_CHUNK_DAYS - 1),
@@ -579,6 +658,13 @@ class IngestionEngine:
                                     time_col="publishedDate",
                                     dedup_keys=spec.dedup_keys)
 
+        if phase == "sync":
+            # Forward march: keeps the high watermark contiguous if a chunk
+            # fails mid-run (see _march_forwards).
+            return await self._march_forwards(
+                spec.dataset, key, fetch, write, start, end,
+                chunk_end_of=self._month_end,             # calendar months
+            )
         return await self._march_backwards(
             spec.dataset, key, fetch, write, start, end,
             chunk_start_of=lambda ce: ce.replace(day=1),  # calendar months

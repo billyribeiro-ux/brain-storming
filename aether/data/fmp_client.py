@@ -56,12 +56,31 @@ def _is_transient(exc: BaseException) -> bool:
 
 
 class _TokenBucket:
-    """Async token bucket: ``rate`` requests per 60s, burst up to ``rate``."""
+    """Async token bucket pacing requests to ``rate`` per 60 seconds.
+
+    Two deliberate choices keep any fixed 60-second window at (or barely
+    above) the plan limit, because FMP may enforce its per-minute quota on
+    fixed windows rather than a rolling average:
+
+    * **The bucket starts EMPTY.** Starting full (the naive choice) would
+      let a fresh backfill fire ``capacity`` requests instantly *plus*
+      ``fill_rate * 60`` refills — i.e. ~2x the plan limit inside the first
+      minute — guaranteeing a 429 storm at every run start, and the retry
+      schedule (~15-20 s of total backoff over 5 attempts) can exhaust
+      itself inside that same rate window, abandoning jobs outright.
+    * **Burst capacity is a few seconds of budget, not a full minute.**
+      Accrual during idle gaps mid-run is capped at ~2 seconds' worth of
+      tokens, so a post-idle burst can exceed the steady rate by only a few
+      requests instead of doubling it.
+    """
 
     def __init__(self, rate_per_minute: int):
-        self.capacity = float(rate_per_minute)
-        self.tokens = float(rate_per_minute)
-        self.fill_rate = rate_per_minute / 60.0
+        fill_rate = rate_per_minute / 60.0
+        # Burst allowance ≈ 2 seconds of steady-state budget (min 1 token so
+        # tiny plans still make progress one request at a time).
+        self.capacity = max(1.0, fill_rate * 2.0)
+        self.tokens = 0.0                     # start empty: pace from t=0
+        self.fill_rate = fill_rate
         self.updated = _time.monotonic()
         self._lock = asyncio.Lock()
 
@@ -164,11 +183,14 @@ class FMPClient:
     #: Measured server behavior (probed live 2026-07-10): a request returns
     #: ONLY bars inside a fixed calendar window anchored at ``to`` —
     #: ``[to - (W-1) days, to]`` — regardless of ``from`` (which merely clips).
-    #: W was measured as 3 calendar days for 1min and 10 for 5min. Unknown
-    #: intervals fall back to 3 (safe: a too-small assumed window costs extra
-    #: requests; a too-large one would silently skip data).
+    #: W was measured as 3 calendar days for 1min and 10 for 5min. ONLY
+    #: measured intervals are listed: a guessed-too-large W would make the
+    #: march step past bars the server never returned — silent data loss —
+    #: whereas the too-small fallback of 3 merely costs extra requests. Any
+    #: unmeasured interval (15min/30min/1hour/4hour) therefore uses the
+    #: safe fallback until someone measures its true window and adds it.
     INTRADAY_WINDOW_DAYS: dict[str, int] = {
-        "1min": 3, "5min": 10, "15min": 10, "30min": 10, "1hour": 30, "4hour": 30,
+        "1min": 3, "5min": 10,
     }
 
     async def intraday_bars(self, symbol: str, interval: str,
@@ -258,8 +280,17 @@ class FMPClient:
                          start: date, end: date,
                          symbol_param: str = "symbols",
                          limit: int = 250, max_pages: int = 400) -> pd.DataFrame:
-        """Drain a paged news endpoint over a date window."""
+        """Drain a paged news endpoint over a date window.
+
+        If the window holds more than ``max_pages * limit`` rows the drain
+        is TRUNCATED at the newest ``max_pages * limit`` articles — the
+        pages arrive newest-first, so the window's older tail is lost. This
+        is loudly logged (a caller marching month-by-month would otherwise
+        step past the window and never revisit the missing tail); callers
+        seeing the warning should re-fetch with a narrower window.
+        """
         frames: list[pd.DataFrame] = []
+        drained = False  # saw a short/empty page => window fully consumed
         for page in range(max_pages):
             params: dict[str, Any] = {
                 "page": page, "limit": limit,
@@ -269,10 +300,23 @@ class FMPClient:
                 params[symbol_param] = symbol
             rows = await self.get(path, **params)
             if not rows:
+                drained = True
                 break
             frames.append(pd.DataFrame(rows))
             if len(rows) < limit:
+                drained = True
                 break
+        if not drained:
+            # Every page (including the last one) came back full: the window
+            # almost certainly holds more rows than we were allowed to page
+            # through. Do not fail — partial news is useful — but make the
+            # loss impossible to miss.
+            logger.warning(
+                "%s: window %s..%s exceeded max_pages=%d x limit=%d "
+                "(~%d rows) — OLDER articles in this window were TRUNCATED; "
+                "re-fetch with a narrower window to recover them",
+                path, start, end, max_pages, limit, max_pages * limit,
+            )
         if not frames:
             return pd.DataFrame()
         out = pd.concat(frames, ignore_index=True)
@@ -306,7 +350,24 @@ class FMPClient:
         self, probe_symbol: str = "AAPL"
     ) -> dict[str, CapabilityStatus]:
         """Active sensing of the API: test every registered endpoint with a
-        cheap request and report what this key can actually reach."""
+        cheap request and report what this key can actually reach.
+
+        Classification of outcomes — chosen so that a persisted ``False``
+        always means *the plan genuinely cannot reach this endpoint*
+        (ingestion skips ``False`` datasets on every future run, so a wrong
+        ``False`` silently starves the lake):
+
+        * 200 with data → available.
+        * 200 with an EMPTY payload → **available**. Emptiness is evidence
+          of *no data in the probe window* (e.g. a quiet news week for the
+          probe symbol), not of no access — the request itself succeeded.
+        * :class:`FMPAccessError` (402/403/404) → unavailable: the API
+          explicitly refused.
+        * :class:`FMPTransientError` (timeout, 5xx, 429 after retries) →
+          **omitted from the results entirely** (capability *unknown*).
+          A network blip must not be persisted as a permanent verdict;
+          absent entries are treated by ingestion as "attempt and see".
+        """
         results: dict[str, CapabilityStatus] = {}
         for name, spec in ENDPOINTS.items():
             params: dict[str, Any] = dict(spec.probe_params)
@@ -324,11 +385,19 @@ class FMPClient:
                 params["limit"] = 1
             try:
                 payload = await self.get(spec.path, **params)
-                ok = bool(payload)
-                results[name] = CapabilityStatus(name, ok, 200,
-                                                 "" if ok else "empty response")
+                # A 200 proves the endpoint is reachable even when the probe
+                # window happens to contain no rows (see docstring).
+                detail = "" if payload else "empty response (reachable)"
+                results[name] = CapabilityStatus(name, True, 200, detail)
             except FMPAccessError as exc:
                 results[name] = CapabilityStatus(name, False, 403, str(exc)[:200])
+            except FMPTransientError as exc:
+                # Transient ≠ unavailable: leave the entry absent (unknown)
+                # so ingestion still attempts it rather than skipping the
+                # dataset forever on the strength of one network blip.
+                logger.warning("probe %-22s -> transient failure (%s) — "
+                               "capability unknown, not recorded", name, exc)
+                continue
             except FMPError as exc:
                 results[name] = CapabilityStatus(name, False, 0, str(exc)[:200])
             logger.info("probe %-22s -> %s", name,
