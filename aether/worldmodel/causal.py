@@ -321,16 +321,20 @@ def build_causal_frame(store: ParquetStore, tickers: list[str],
         raise ValueError("build_causal_frame: tickers share no common "
                          "regular-session minutes")
 
-    # Market-wide channels, computed once on the joined minute grid and in
-    # the exact CAUSAL_MARKET_CHANNELS order.
-    market = {
-        "treasury_10y_chg": _treasury_channel(store, frame.index),
-        "news_rate": _news_channel(store, kept, frame.index),
-    }
-    for ch in CAUSAL_MARKET_CHANNELS:
-        frame[f"MKT.{ch}"] = market[ch]
-
+    # Market-wide channels, appended in the exact CAUSAL_MARKET_CHANNELS
+    # order ("treasury_10y_chg", "news_rate"). Treasury goes on FIRST and
+    # its NaN rows (minutes before the first available previous-day change)
+    # are dropped BEFORE the news channel is computed, so the news z-score's
+    # "window" is exactly the rows the final frame keeps.
+    assert CAUSAL_MARKET_CHANNELS == ("treasury_10y_chg", "news_rate")
+    frame["MKT.treasury_10y_chg"] = _treasury_channel(store, frame.index)
     frame = frame.dropna()
+    if frame.empty:
+        raise ValueError("build_causal_frame: no minutes survive the "
+                         "treasury previous-day-change requirement")
+    frame["MKT.news_rate"] = _news_channel(store, kept, frame.index)
+
+    frame = frame.dropna()  # defensive; news_rate introduces no NaNs
     frame.index.name = "date"
     logger.info("causal frame: %d minutes x %d channels (%s .. %s)",
                 len(frame), frame.shape[1], start, end)
